@@ -1,0 +1,3 @@
+(function() {var implementors = {
+"core_crypto":[["impl <a class=\"trait\" href=\"utils_types/traits/trait.PeerIdLike.html\" title=\"trait utils_types::traits::PeerIdLike\">PeerIdLike</a> for <a class=\"struct\" href=\"core_crypto/types/struct.OffchainPublicKey.html\" title=\"struct core_crypto::types::OffchainPublicKey\">OffchainPublicKey</a>"]]
+};if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SQL_DB_FILE_NAME","SQL_TABLE_LABEL"],"struct":["SqliteShim"]};

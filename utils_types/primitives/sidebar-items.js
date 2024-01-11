@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["BalanceType"],"struct":["Address","AuthorizationToken","Balance","EthereumChallenge","Snapshot","U256"]};

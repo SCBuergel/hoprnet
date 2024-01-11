@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ACK_RX_QUEUE_SIZE","ACK_TX_QUEUE_SIZE"],"enum":["AckProcessed","AckToProcess","Reply"],"struct":["AcknowledgementActions","AcknowledgementInteraction","AcknowledgementProcessor"]};

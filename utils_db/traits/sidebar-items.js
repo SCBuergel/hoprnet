@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["BatchOperation"],"struct":["Del","Put"],"trait":["AsyncKVStorage","KVStorage"],"type":["StorageValueIterator"]};

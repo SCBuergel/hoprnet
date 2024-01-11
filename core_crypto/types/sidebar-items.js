@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["Challenge","CompressedPublicKey","CurvePoint","HalfKey","HalfKeyChallenge","Hash","OffchainPublicKey","OffchainSignature","PublicKey","Response","Signature","VrfParameters"],"trait":["ToChecksum"]};

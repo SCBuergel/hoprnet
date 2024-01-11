@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["hopr_stake_season_7"]};

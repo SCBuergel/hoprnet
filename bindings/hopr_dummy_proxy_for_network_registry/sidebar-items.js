@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["hopr_dummy_proxy_for_network_registry"]};
