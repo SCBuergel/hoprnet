@@ -89,6 +89,12 @@ use hopr_utils::{
 pub use multiaddr::Protocol;
 use tracing::{debug, warn};
 
+/// How long a Session ignores its counterparty's SURB level after its return path was found broken.
+/// Long enough to outlast the silence gate that produced the evidence, so a path that stays dead is
+/// re-marked before the previous mark lapses, and short enough that a path which recovers unnoticed
+/// returns to closed-loop control promptly.
+const RETURN_PATH_DEGRADED_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[cfg(feature = "runtime-tokio")]
 use crate::path::BackgroundPathCacheRefreshable;
 pub use crate::{config::HoprProtocolConfig, protocol::PeerProtocolCounterRegistry};
@@ -814,7 +820,6 @@ where
         // Long enough to outlast the silence gate that produced the evidence, so a path that stays
         // dead is re-marked before the previous mark lapses, and short enough that a path which
         // recovers unnoticed returns to closed-loop control promptly.
-        const RETURN_PATH_DEGRADED_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
         let surb_flush_graph = self.graph.clone();
         let surb_flush_interval = self.cfg.surb_flush_interval;
         let surb_flush_smgr = self.smgr.clone();
@@ -1125,6 +1130,47 @@ where
     /// starts with a relayer this node can no longer pay.
     pub fn surb_store(&self) -> &MemorySurbStore {
         &self.path_planner.surb_store
+    }
+
+    /// A hook that keeps path planning and SURB production in step with the connection to a peer;
+    /// call it with the peer and whether it is now connected.
+    ///
+    /// On a lost connection, the peer is excluded from path planning, and every Session whose return
+    /// paths ran through it is marked return-path-degraded, so it refills the counterparty's SURBs over
+    /// the remaining paths -- the same refill the SURB round-trip telemetry triggers, but without
+    /// waiting for evidence it cannot get when a Session's only return traffic went silent (its blind
+    /// spot). Re-plan before refill, as there. On a restored connection the peer is planned again.
+    pub fn relay_connection_hook(
+        &self,
+    ) -> Arc<dyn Fn(OffchainPublicKey, bool) -> futures::future::BoxFuture<'static, ()> + Send + Sync> {
+        let planner = self.path_planner.clone();
+        let chain = self.chain_api.clone();
+        let smgr = self.smgr.clone();
+        Arc::new(move |peer: OffchainPublicKey, connected: bool| {
+            let (planner, chain, smgr) = (planner.clone(), chain.clone(), smgr.clone());
+            async move {
+                if connected {
+                    planner.include_relayer(&peer);
+                    return;
+                }
+                for counterparty in planner.exclude_relayer(&peer).await {
+                    match chain.packet_key_to_chain_key(&counterparty) {
+                        Ok(Some(address)) => {
+                            let sessions = smgr.mark_return_path_degraded(
+                                &hopr_api::types::internal::prelude::NodeId::Chain(address),
+                                RETURN_PATH_DEGRADED_GRACE,
+                            );
+                            tracing::info!(relay = %peer, %counterparty, sessions, "relay disconnected, refilling return paths that ran through it");
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(%counterparty, %error, "could not resolve a counterparty's chain key to refill its return paths")
+                        }
+                    }
+                }
+            }
+            .boxed()
+        })
     }
 
     #[tracing::instrument(level = "debug", skip(self))]

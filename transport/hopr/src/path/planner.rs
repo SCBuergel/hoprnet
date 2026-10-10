@@ -272,12 +272,25 @@ async fn rebuild_candidates<R, S>(
     dest_key: OffchainPublicKey,
     hops: usize,
     kind: &'static str,
+    excluded: &std::collections::HashSet<OffchainPublicKey>,
 ) -> Result<Option<hopr_utils::statistics::WeightedCollection<ValidatedPath>>>
 where
     R: ChainKeyOperations + ChainReadChannelOperations + Send + Sync,
     S: PathSelector,
 {
     let candidates = selector.select_path(src_key, dest_key, hops)?;
+
+    // Skip candidates through a relay this node has lost its connection to (see
+    // `PathPlanner::exclude_relayer`): path selection does not look at connection status, so it keeps
+    // offering them. Unless that leaves nothing -- a possibly dead path beats none.
+    let candidates = if excluded.is_empty() {
+        candidates
+    } else {
+        let (through_excluded, clear): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|pwc| pwc.path.iter().any(|node| excluded.contains(node)));
+        if clear.is_empty() { through_excluded } else { clear }
+    };
 
     let chain_resolver = ChainPathResolver::from(resolver);
     let mut valid_paths: Vec<(ValidatedPath, f64)> = Vec::with_capacity(candidates.len());
@@ -445,6 +458,8 @@ pub struct PathPlanner<Surb, R, S> {
     weighting: WeightingParams,
     return_path_weight_temper: f64,
     return_path_exploration: f64,
+    /// Relays this node has lost its connection to; see [`PathPlanner::exclude_relayer`].
+    excluded_relayers: Arc<std::sync::RwLock<std::collections::HashSet<OffchainPublicKey>>>,
 }
 
 impl<Surb, R, S> PathPlanner<Surb, R, S>
@@ -475,7 +490,74 @@ where
             },
             return_path_weight_temper: config.return_path_weight_temper,
             return_path_exploration: config.return_path_exploration,
+            excluded_relayers: Default::default(),
         }
+    }
+
+    /// Stops routing through `relay`, which this node has lost its connection to.
+    ///
+    /// New path selections skip it (unless nothing else is left), and every cached entry that still
+    /// has another path drops the paths through it at once, rather than at the next refresh. Path
+    /// selection itself does not look at connection status, so without this a dead first or last hop
+    /// keeps being drawn for forward packets and for the return paths minted into SURBs.
+    ///
+    /// Returns the counterparties whose return paths to this node changed: their Sessions are
+    /// replying through SURBs that may run through `relay`, and need fresh ones.
+    pub async fn exclude_relayer(&self, relay: &OffchainPublicKey) -> Vec<OffchainPublicKey> {
+        if !self.excluded_relayers.write().unwrap_or_else(|e| e.into_inner()).insert(*relay) {
+            return Vec::new();
+        }
+        let keys = self
+            .cache
+            .iter()
+            .map(|(key, _)| *key.as_ref())
+            .filter(|(_, _, hops)| *hops > 0)
+            .collect::<Vec<PlannerCacheKey>>();
+
+        let mut changed_return_paths = Vec::new();
+        for key in keys {
+            let mut pruned = false;
+            // Through `and_compute_with`, like every other writer of the cache (see `put_if_unchanged`).
+            self.cache
+                .entry(key)
+                .and_compute_with(|current| {
+                    let op = match current {
+                        Some(current) => {
+                            let kept = current
+                                .value()
+                                .iter()
+                                .filter(|(path, _)| !path.transport_path().iter().any(|node| node == relay))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            if kept.is_empty() || kept.len() == current.value().len() {
+                                moka::ops::compute::Op::Nop
+                            } else {
+                                pruned = true;
+                                moka::ops::compute::Op::Put(Arc::new(hopr_utils::statistics::WeightedCollection::new(kept)))
+                            }
+                        }
+                        None => moka::ops::compute::Op::Nop,
+                    };
+                    futures::future::ready(op)
+                })
+                .await;
+            if pruned && key.1 == self.me && key.0 != self.me {
+                changed_return_paths.push(key.0);
+            }
+        }
+        tracing::debug!(%relay, counterparties = changed_return_paths.len(), "excluded a disconnected relay from path planning");
+        changed_return_paths
+    }
+
+    /// Routes through `relay` again once the connection to it is back; see [`Self::exclude_relayer`].
+    pub fn include_relayer(&self, relay: &OffchainPublicKey) {
+        if self.excluded_relayers.write().unwrap_or_else(|e| e.into_inner()).remove(relay) {
+            tracing::debug!(%relay, "relay reachable again for path planning");
+        }
+    }
+
+    fn excluded_snapshot(&self) -> std::collections::HashSet<OffchainPublicKey> {
+        self.excluded_relayers.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Resolve a [`NodeId`] to an [`OffchainPublicKey`].
@@ -579,12 +661,13 @@ where
         let selector = self.selector.clone();
         let weighting = self.weighting;
         let me = self.me;
+        let excluded = self.excluded_snapshot();
 
         self.cache
             .try_get_with(cache_key, async move {
                 trace!(hops = hops_usize, "path cache miss, querying selector");
                 rebuild_candidates(
-                    &*resolver, &*selector, weighting, me, src_key, dest_key, hops_usize, "fill",
+                    &*resolver, &*selector, weighting, me, src_key, dest_key, hops_usize, "fill", &excluded,
                 )
                 .await?
                 .map(Arc::new)
@@ -621,6 +704,7 @@ where
             .collect::<Vec<PlannerCacheKey>>();
 
         let mut moved = 0usize;
+        let excluded = self.excluded_snapshot();
         for (src_key, dest_key, hops) in keys {
             if let Ok(Some(weighted)) = rebuild_candidates(
                 &*self.resolver,
@@ -631,6 +715,7 @@ where
                 dest_key,
                 hops as usize,
                 "recompute",
+                &excluded,
             )
             .await
             {
@@ -864,6 +949,7 @@ where
         let refresh_period = self.refresh_period;
         let weighting = self.weighting;
         let me = self.me;
+        let excluded_relayers = self.excluded_relayers.clone();
 
         // run at a non-zero interval
         futures_time::stream::interval(futures_time::time::Duration::from_millis(
@@ -874,6 +960,7 @@ where
             let resolver = resolver.clone();
             let selector = selector.clone();
             let weighting = weighting;
+            let excluded = excluded_relayers.read().unwrap_or_else(|e| e.into_inner()).clone();
 
             async move {
                 for (key, swept) in cache.iter() {
@@ -897,6 +984,7 @@ where
                         dest_key,
                         hops_u32 as usize,
                         "background-refresh",
+                        &excluded,
                     )
                     .await
                     {

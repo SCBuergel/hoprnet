@@ -626,18 +626,23 @@ where
         // spending SURBs through a silent relay long after it went away, stalling the session's return path).
         let surb_store = transport_api.surb_store().clone();
         let key_ids = chain_api.clone();
+        // ... and stop planning paths through it, refilling the SURBs of Sessions whose return paths ran
+        // through it (this node as the Entry).
+        let relay_connection_hook = transport_api.relay_connection_hook();
         spawn(async move {
             network_events
                 .for_each(|event| {
                     let graph_updater = graph_updater.clone();
                     let surb_store = surb_store.clone();
                     let key_ids = key_ids.clone();
+                    let relay_connection_hook = relay_connection_hook.clone();
                     async move {
                         let (peer_id, connected) = match event {
                             hopr_api::network::NetworkEvent::PeerConnected(p) => (p, true),
                             hopr_api::network::NetworkEvent::PeerDisconnected(p) => (p, false),
                         };
                         if let Ok(opk) = hopr_api::OffchainPublicKey::from_peerid(&peer_id) {
+                            relay_connection_hook(opk, connected).await;
                             {
                                 use hopr_api::chain::KeyIdMapping;
                                 if let Some(relayer) = key_ids.key_id_mapper_ref().map_key_to_id(&opk) {
