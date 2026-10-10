@@ -1146,14 +1146,27 @@ where
         let planner = self.path_planner.clone();
         let chain = self.chain_api.clone();
         let smgr = self.smgr.clone();
+        // Trial switches: "0" turns off excluding the relay from path planning, or only the refill.
+        let flag = |name: &str| std::env::var(name).map(|v| v.trim() != "0").unwrap_or(true);
+        let exclude = flag("HOPR_INTERNAL_RELAY_DISCONNECT_EXCLUDE");
+        let refill = flag("HOPR_INTERNAL_RELAY_DISCONNECT_REFILL");
+        tracing::info!(exclude, refill, "relay disconnect handling");
         Arc::new(move |peer: OffchainPublicKey, connected: bool| {
             let (planner, chain, smgr) = (planner.clone(), chain.clone(), smgr.clone());
             async move {
+                if !exclude {
+                    return;
+                }
                 if connected {
                     planner.include_relayer(&peer);
                     return;
                 }
-                for counterparty in planner.exclude_relayer(&peer).await {
+                let changed = planner.exclude_relayer(&peer).await;
+                if !refill {
+                    tracing::info!(relay = %peer, counterparties = changed.len(), "relay disconnected, excluded from path planning");
+                    return;
+                }
+                for counterparty in changed {
                     match chain.packet_key_to_chain_key(&counterparty) {
                         Ok(Some(address)) => {
                             let sessions = smgr.mark_return_path_degraded(
