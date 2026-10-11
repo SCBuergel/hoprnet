@@ -98,6 +98,9 @@ const ACK_DELAY_ALPHA: f64 = 0.02;
 const ACK_DELAY_FLOOR_SLICE: Duration = Duration::from_secs(30);
 const ACK_DELAY_FLOOR_SLICES: usize = 10;
 
+/// Acknowledged packets before the floor starts tracking; see [`AckDelay::acked`].
+const ACK_DELAY_WARMUP: u64 = 100;
+
 /// Without an acknowledgement for this long the estimate says nothing. A relay the planner has
 /// steered away from still gets probes, so this ages out only a peer that went quiet altogether.
 const ACK_DELAY_STALE: Duration = Duration::from_secs(10);
@@ -118,6 +121,7 @@ const ACK_DELAY_STALE: Duration = Duration::from_secs(10);
 struct AckDelay {
     sent_at: VecDeque<Instant>,
     smoothed_ms: Option<f64>,
+    acked: u64,
     last_ack: Option<Instant>,
     /// `(slice start, lowest smoothed delay in it)`, oldest first.
     floor: VecDeque<(Instant, f64)>,
@@ -160,6 +164,12 @@ impl AckDelay {
         };
         self.smoothed_ms = Some(smoothed);
         self.last_ack = Some(now);
+        self.acked = self.acked.saturating_add(n);
+        // The first batches average over fewer packets than steady traffic does, so they read low and
+        // would pin the floor below where it belongs.
+        if self.acked < ACK_DELAY_WARMUP {
+            return;
+        }
 
         match self.floor.back_mut() {
             Some((start, min)) if now.saturating_duration_since(*start) < ACK_DELAY_FLOOR_SLICE => {
@@ -179,6 +189,9 @@ impl AckDelay {
         }
         let smoothed = self.smoothed_ms?;
         let floor = self.floor.iter().map(|(_, min)| *min).fold(f64::INFINITY, f64::min);
+        if !floor.is_finite() {
+            return None;
+        }
         let ms = |v: f64| Duration::from_secs_f64(v.max(0.0) / 1000.0);
         Some((ms(smoothed), ms(floor.min(smoothed))))
     }
