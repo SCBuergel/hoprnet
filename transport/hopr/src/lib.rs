@@ -318,6 +318,12 @@ where
         if let Some(v) = std::env::var("HOPR_INTERNAL_PATH_CONGESTION_RELATIVE").ok() {
             planner_config.congestion_relative = v.trim() != "0";
         }
+        if let Some(q) = std::env::var("HOPR_INTERNAL_PATH_CONGESTION_QUANTILE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+        {
+            planner_config.congestion_baseline_quantile = q;
+        }
         if let Some(v) = std::env::var("HOPR_INTERNAL_PATH_CONGESTION_INTEGRAL").ok() {
             planner_config.congestion_integral = v.trim() == "1";
         }

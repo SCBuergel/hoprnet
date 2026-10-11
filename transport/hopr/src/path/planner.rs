@@ -171,6 +171,17 @@ pub struct PathPlannerConfig {
     /// [`RelayWeights`]) instead of by a factor recomputed from the latest estimate at every draw.
     #[default = false]
     pub congestion_integral: bool,
+    /// Which sibling a relay's queueing is judged against when
+    /// [`Self::congestion_relative`]: the quantile of the candidates' queueing, `0.0` the
+    /// least-queued, `0.5` the median.
+    ///
+    /// Against the least-queued, relays that are all slow alike (several capped relays, each queueing
+    /// the bursts it is sent) are judged by noise: one or two read lowest, keep their weight, and the
+    /// rest fall to the floor -- the whole session then rides on one or two slow relays. Against the
+    /// median, half the candidates are always at or below the baseline, so the draw cannot collapse
+    /// onto a few; a relay well behind the median is still steered away from.
+    #[default = 0.0]
+    pub congestion_baseline_quantile: f64,
 }
 
 fn validate_unit_interval(value: f64) -> std::result::Result<(), ValidationError> {
@@ -475,6 +486,7 @@ pub struct PathPlanner<Surb, R, S> {
     congestion: Option<crate::protocol::PeerProtocolCounterRegistry>,
     congestion_delay_reference: Duration,
     congestion_relative: bool,
+    congestion_baseline_quantile: f64,
     relay_weights: Option<Arc<std::sync::Mutex<RelayWeights>>>,
 }
 
@@ -578,6 +590,7 @@ where
             congestion: None,
             congestion_delay_reference: config.congestion_delay_reference,
             congestion_relative: config.congestion_relative,
+            congestion_baseline_quantile: config.congestion_baseline_quantile.clamp(0.0, 1.0),
             relay_weights: config
                 .congestion_integral
                 .then(|| Arc::new(std::sync::Mutex::new(RelayWeights::default()))),
@@ -607,9 +620,11 @@ where
             relays.iter().map(|r| r.map(|relay| registry.congestion(relay))).collect();
         // Relative only among at least two relays that have an estimate: one alone has nothing to be
         // compared with.
-        let known: Vec<Duration> = links.iter().flatten().filter_map(|l| l.queueing).collect();
+        let mut known: Vec<Duration> = links.iter().flatten().filter_map(|l| l.queueing).collect();
+        known.sort();
         let least = if self.congestion_relative && known.len() >= 2 {
-            known.iter().copied().min().unwrap_or_default()
+            let i = ((known.len() - 1) as f64 * self.congestion_baseline_quantile).round() as usize;
+            known[i.min(known.len() - 1)]
         } else {
             Duration::ZERO
         };
@@ -2168,6 +2183,21 @@ mod tests {
         registry.set_ack_delay_for_test(&a, Duration::from_millis(370), Duration::from_millis(120));
         let behind = return_draws_through(&planner, &a, 2000).await;
         assert!(behind < 300, "a relayer 150 ms behind its sibling must lose most draws: {behind} of 2000");
+    }
+
+    /// Several relays queueing alike must not leave the draw on whichever reads lowest: against the
+    /// median, a draw over relayers at 220 ms and 240 ms stays shared.
+    #[tokio::test]
+    async fn a_median_baseline_should_keep_relayers_that_queue_alike_in_the_draw() {
+        let (planner, _graph) = two_relayer_return_planner();
+        let registry = crate::protocol::PeerProtocolCounterRegistry::default();
+        let mut planner = planner.with_congestion(registry.clone());
+        planner.congestion_baseline_quantile = 0.5;
+        let (a, b) = (pubkey(&SECRET_A), pubkey(&SECRET_B));
+        registry.set_ack_delay_for_test(&a, Duration::from_millis(360), Duration::from_millis(120));
+        registry.set_ack_delay_for_test(&b, Duration::from_millis(340), Duration::from_millis(120));
+        let through_a = return_draws_through(&planner, &a, 2000).await;
+        assert!(through_a > 500, "relayers queueing alike must share the draws: {through_a} of 2000");
     }
 
     #[test]
