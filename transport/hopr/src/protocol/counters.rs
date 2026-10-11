@@ -495,9 +495,9 @@ mod tests {
         );
     }
 
-    /// Sends `per_batch` packets every 10 ms and acknowledges them in 200 ms batches, each packet
-    /// `delay` after it was sent, from `start` for `secs` seconds. Returns the time it ended at.
-    fn feed(est: &mut AckDelay, start: std::time::Instant, secs: u64, delay: Duration) -> std::time::Instant {
+    /// Sends a packet every 10 ms for `secs` seconds and acknowledges them in 200 ms batches, each
+    /// packet `delay(elapsed)` after it was sent. Returns the time it ended at.
+    fn feed(est: &mut AckDelay, start: std::time::Instant, secs: u64, delay: impl Fn(Duration) -> Duration) -> std::time::Instant {
         let mut now = start;
         let end = start + Duration::from_secs(secs);
         let mut pending: std::collections::VecDeque<std::time::Instant> = Default::default();
@@ -508,7 +508,8 @@ mod tests {
             now += Duration::from_millis(10);
             if now >= next_flush {
                 // The batch carries every packet that has reached the peer by the flush.
-                let n = pending.iter().take_while(|sent| **sent + delay <= now).count();
+                let d = delay(now - start);
+                let n = pending.iter().take_while(|sent| **sent + d <= now).count();
                 pending.drain(..n);
                 if n > 0 {
                     est.acked(n as u64, now);
@@ -522,7 +523,7 @@ mod tests {
     #[test]
     fn ack_delay_should_report_no_queue_on_a_steady_link() -> anyhow::Result<()> {
         let mut est = AckDelay::default();
-        let now = feed(&mut est, std::time::Instant::now(), 30, Duration::from_millis(40));
+        let now = feed(&mut est, std::time::Instant::now(), 30, |_| Duration::from_millis(40));
         let q = est.queueing_delay(now).context("a busy peer must have an estimate")?;
         assert!(q < Duration::from_millis(10), "a constant delay is the floor, not a queue: {q:?}");
         Ok(())
@@ -531,9 +532,9 @@ mod tests {
     #[test]
     fn ack_delay_should_report_a_queue_that_builds_up() -> anyhow::Result<()> {
         let mut est = AckDelay::default();
-        let start = std::time::Instant::now();
-        let now = feed(&mut est, start, 30, Duration::from_millis(40));
-        let now = feed(&mut est, now, 10, Duration::from_millis(190));
+        let now = feed(&mut est, std::time::Instant::now(), 40, |elapsed| {
+            Duration::from_millis(if elapsed < Duration::from_secs(30) { 40 } else { 190 })
+        });
         let q = est.queueing_delay(now).context("a busy peer must have an estimate")?;
         assert!(
             q > Duration::from_millis(120) && q < Duration::from_millis(170),
@@ -545,7 +546,7 @@ mod tests {
     #[test]
     fn ack_delay_should_say_nothing_once_the_peer_went_quiet() {
         let mut est = AckDelay::default();
-        let now = feed(&mut est, std::time::Instant::now(), 5, Duration::from_millis(40));
+        let now = feed(&mut est, std::time::Instant::now(), 5, |_| Duration::from_millis(40));
         assert!(est.queueing_delay(now).is_some());
         assert!(est.queueing_delay(now + ACK_DELAY_STALE + Duration::from_secs(1)).is_none());
     }
@@ -559,7 +560,7 @@ mod tests {
             est.sent(start + Duration::from_millis(i));
         }
         let later = start + ACK_DELAY_MAX_WAIT + Duration::from_secs(1);
-        let now = feed(&mut est, later, 30, Duration::from_millis(40));
+        let now = feed(&mut est, later, 30, |_| Duration::from_millis(40));
         let (smoothed, _) = est.estimate(now).context("a busy peer must have an estimate")?;
         assert!(
             smoothed < Duration::from_millis(200),
@@ -576,6 +577,11 @@ mod tests {
         let counters = registry.get_or_create(&peer);
         counters.record_message_sent();
         counters.record_acks_received(1);
+        assert!(registry.queueing_delay(&peer).is_none(), "no estimate before the warm-up");
+        for _ in 0..ACK_DELAY_WARMUP {
+            counters.record_message_sent();
+            counters.record_acks_received(1);
+        }
         assert!(registry.queueing_delay(&peer).is_some());
         assert_eq!(registry.ack_delays().len(), 1);
     }
