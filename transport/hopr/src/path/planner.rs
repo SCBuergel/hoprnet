@@ -159,6 +159,14 @@ pub struct PathPlannerConfig {
     /// within about a second rather than at the next cache refresh. Zero disables it.
     #[default(Duration::from_millis(50))]
     pub congestion_delay_reference: Duration,
+    /// Judge each relay's queueing against the least-queued relay among the candidates of the same
+    /// draw, rather than against zero.
+    ///
+    /// Jitter on every link reads as a few tens of milliseconds of "queue" on every relay alike; on
+    /// an absolute scale that penalises all of them, and the draw piles onto whichever one or two
+    /// happen to read lowest. Only the difference between relays says which of them to avoid.
+    #[default = true]
+    pub congestion_relative: bool,
 }
 
 fn validate_unit_interval(value: f64) -> std::result::Result<(), ValidationError> {
@@ -462,6 +470,7 @@ pub struct PathPlanner<Surb, R, S> {
     return_path_exploration: f64,
     congestion: Option<crate::protocol::PeerProtocolCounterRegistry>,
     congestion_delay_reference: Duration,
+    congestion_relative: bool,
 }
 
 /// Share of the draws a path keeps when the relay next to this node queues `queueing` on top of
@@ -522,6 +531,7 @@ where
             return_path_exploration: config.return_path_exploration,
             congestion: None,
             congestion_delay_reference: config.congestion_delay_reference,
+            congestion_relative: config.congestion_relative,
         }
     }
 
@@ -532,14 +542,31 @@ where
         self
     }
 
-    /// The draw weight multiplier for paths whose hop next to this node is `relay`.
-    fn relay_congestion_factor(&self, relay: &OffchainPublicKey) -> f64 {
-        match &self.congestion {
-            Some(registry) if !self.congestion_delay_reference.is_zero() => {
-                link_factor(&registry.congestion(relay), self.congestion_delay_reference)
-            }
-            _ => 1.0,
-        }
+    /// The draw weight multipliers for candidates whose hop next to this node is `relays[i]`
+    /// (`None`: no such hop, neutral). See [`PathPlannerConfig::congestion_relative`].
+    fn relay_congestion_factors(&self, relays: &[Option<&OffchainPublicKey>]) -> Vec<f64> {
+        let Some(registry) = self.congestion.as_ref().filter(|_| !self.congestion_delay_reference.is_zero()) else {
+            return vec![1.0; relays.len()];
+        };
+        let links: Vec<Option<crate::protocol::LinkCongestion>> =
+            relays.iter().map(|r| r.map(|relay| registry.congestion(relay))).collect();
+        // Relative only among at least two relays that have an estimate: one alone has nothing to be
+        // compared with.
+        let known: Vec<Duration> = links.iter().flatten().filter_map(|l| l.queueing).collect();
+        let least = if self.congestion_relative && known.len() >= 2 {
+            known.iter().copied().min().unwrap_or_default()
+        } else {
+            Duration::ZERO
+        };
+        links
+            .iter()
+            .map(|link| {
+                link.map_or(1.0, |mut link| {
+                    link.queueing = link.queueing.map(|q| q.saturating_sub(least));
+                    link_factor(&link, self.congestion_delay_reference)
+                })
+            })
+            .collect()
     }
 
     /// Picks one of `paths` from this node, its weight scaled by the congestion at its first hop.
@@ -548,9 +575,11 @@ where
             return paths.pick_one();
         }
         let items: Vec<&(ValidatedPath, f64)> = paths.iter().collect();
+        let factors = self.relay_congestion_factors(&items.iter().map(|(vp, _)| vp.first()).collect::<Vec<_>>());
         let weights: Vec<f64> = items
             .iter()
-            .map(|(vp, w)| w.max(0.0) * vp.first().map_or(1.0, |relay| self.relay_congestion_factor(relay)))
+            .zip(factors)
+            .map(|((_, w), factor)| w.max(0.0) * factor)
             .collect();
         pick_weighted_index(&weights)
             .map(|i| items[i].0.clone())
@@ -794,14 +823,12 @@ where
         );
         // After tempering, so a queue at a relay takes effect at full strength: the temper exists to
         // spread load over relays that look alike, not to keep load on one that is visibly behind.
-        let congestion: Vec<f64> = items
-            .iter()
-            .map(|(vp, _)| {
-                vp.len()
-                    .checked_sub(2)
-                    .map_or(1.0, |i| self.relay_congestion_factor(&vp[i]))
-            })
-            .collect();
+        let congestion: Vec<f64> = self.relay_congestion_factors(
+            &items
+                .iter()
+                .map(|(vp, _)| vp.len().checked_sub(2).map(|i| &vp[i]))
+                .collect::<Vec<_>>(),
+        );
         for (weight, factor) in weights.iter_mut().zip(congestion.iter()) {
             *weight *= factor;
         }
@@ -2042,6 +2069,26 @@ mod tests {
             congested < 300,
             "a queueing relayer must lose most of its draws: {congested} of 2000"
         );
+    }
+
+    /// Jitter shows as the same few tens of milliseconds of queueing on every relay; judged against
+    /// each other they are alike and share the draws, while one well above the rest still loses them.
+    #[tokio::test]
+    async fn return_draws_should_judge_queueing_relative_to_the_least_queued_relayer() {
+        let (planner, _graph) = two_relayer_return_planner();
+        let registry = crate::protocol::PeerProtocolCounterRegistry::default();
+        let planner = planner.with_congestion(registry.clone());
+        let a = pubkey(&SECRET_A);
+        let b = pubkey(&SECRET_B);
+        for relayer in [a, b] {
+            registry.set_ack_delay_for_test(&relayer, Duration::from_millis(220), Duration::from_millis(120));
+        }
+        let alike = return_draws_through(&planner, &a, 2000).await;
+        assert!((800..1200).contains(&alike), "alike relayers must share the draws: {alike} of 2000");
+
+        registry.set_ack_delay_for_test(&a, Duration::from_millis(370), Duration::from_millis(120));
+        let behind = return_draws_through(&planner, &a, 2000).await;
+        assert!(behind < 300, "a relayer 150 ms behind its sibling must lose most draws: {behind} of 2000");
     }
 
     #[tokio::test]
