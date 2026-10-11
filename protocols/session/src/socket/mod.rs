@@ -74,6 +74,18 @@ pub struct SessionSocketConfig {
     /// Default is false.
     #[default(false)]
     pub datagram: bool,
+    /// On a [`Self::datagram`] session, put frames back in order but never hold one back longer than
+    /// this for a missing predecessor.
+    ///
+    /// Without it (`None`, the default) a datagram goes up the moment it is complete. That keeps a
+    /// lost frame from stalling everything behind it, but hands reordering straight to the protocol
+    /// above, and TCP inside a WireGuard tunnel reads reordering as loss: with one relay of ten
+    /// slowed to 1 Mbit/s, about a tenth of the frames arrived a few hundred milliseconds late, the
+    /// sender retransmitted 11 % of its segments (half of them needlessly, by its DSACKs) and the
+    /// tunnel fell from 10 to 1.2 Mbit/s. A window a little longer than the spread of path delays
+    /// hides ordinary reordering while still bounding the stall a lost frame causes.
+    #[default(None)]
+    pub datagram_reorder_window: Option<Duration>,
     /// Capacity of the control channel, the maximum number of outstanding control messages.
     ///
     /// This option affects stateful sockets.
@@ -261,7 +273,7 @@ impl<const C: usize> SessionSocket<C, Stateless<C>> {
         // frames back for a missing one turns every lost datagram into a frame_timeout stall of everything behind
         // it; the datagram protocol above (WireGuard, and TCP inside it) copes with loss and reordering itself, but
         // not with multi-second stalls (a relay outage left a WireGuard tunnel stalled until its watchdog reconnected).
-        let downstream_frames_out = if cfg.datagram {
+        let downstream_frames_out = if cfg.datagram && cfg.datagram_reorder_window.is_none() {
             let mut delivered = DeliveredFrames::new(cfg.capacity);
             let mut terminating_id = None;
             let (terminated_tx, terminated_rx) = futures::channel::oneshot::channel::<()>();
@@ -310,12 +322,18 @@ impl<const C: usize> SessionSocket<C, Stateless<C>> {
                 })
                 .boxed()
         } else {
+            // A datagram session with a reorder window waits that long for a missing frame, and only for
+            // reordering: a datagram is never too old to deliver once its predecessors are in or given up on.
+            let (max_wait, max_item_age) = match (cfg.datagram, cfg.datagram_reorder_window) {
+                (true, Some(window)) => (window, None),
+                _ => (cfg.frame_timeout, cfg.max_frame_age),
+            };
             reassembled
                 // Put the frames into the correct sequence by Frame Ids
                 .sequencer_with(crate::processing::SequencerConfig {
-                    max_wait: cfg.frame_timeout,
+                    max_wait,
                     capacity: cfg.capacity,
-                    max_item_age: cfg.max_frame_age,
+                    max_item_age,
                     max_frames_behind_gap: cfg.max_frames_behind_gap,
                 })
                 // Discard frames missing from the sequence
@@ -953,6 +971,121 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    /// Captures `n` datagrams Alice writes, ready to be fed to Bob in any order.
+    async fn datagrams_on_the_wire(sock_cfg: SessionSocketConfig, n: u8) -> anyhow::Result<Vec<Box<[u8]>>> {
+        let (alice_out, mut wire) = futures::channel::mpsc::unbounded();
+        let (_alice_in_tx, alice_in) = futures::channel::mpsc::unbounded();
+        let mut alice_socket = SessionSocket::<MTU, _>::new_stateless(
+            "alice",
+            HandFedPipe {
+                written: alice_out,
+                to_read: alice_in,
+            },
+            sock_cfg,
+            #[cfg(feature = "telemetry")]
+            NoopTracker,
+        )?;
+        let mut packets = Vec::new();
+        for i in 0..n {
+            alice_socket.write_all(&[i; 100]).await?;
+            alice_socket.flush().await?;
+            packets.push(wire.next().await.context("one packet per datagram")?);
+        }
+        Ok(packets)
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn datagram_socket_with_a_reorder_window_should_deliver_reordered_datagrams_in_order() -> anyhow::Result<()> {
+        let sock_cfg = SessionSocketConfig {
+            frame_size: FRAME_SIZE,
+            frame_timeout: Duration::from_secs(5),
+            datagram: true,
+            datagram_reorder_window: Some(Duration::from_millis(500)),
+            ..Default::default()
+        };
+        let mut packets = datagrams_on_the_wire(sock_cfg, 3).await?;
+        // Datagram 0 arrives last, behind 1 and 2.
+        let first = packets.remove(0);
+        packets.push(first);
+
+        let (bob_in_tx, bob_in) = futures::channel::mpsc::unbounded();
+        let (bob_out, _bob_wire) = futures::channel::mpsc::unbounded();
+        for packet in packets {
+            bob_in_tx.unbounded_send(packet)?;
+        }
+        let mut bob_socket = SessionSocket::<MTU, _>::new_stateless(
+            "bob",
+            HandFedPipe {
+                written: bob_out,
+                to_read: bob_in,
+            },
+            sock_cfg,
+            #[cfg(feature = "telemetry")]
+            NoopTracker,
+        )?;
+
+        let mut buf = [0u8; 100];
+        for expected in 0..3u8 {
+            bob_socket
+                .read_exact(&mut buf)
+                .timeout(futures_time::time::Duration::from_secs(1))
+                .await??;
+            assert_eq!([expected; 100], buf, "datagrams must come up in the order they were sent");
+        }
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn datagram_socket_with_a_reorder_window_should_wait_for_a_lost_datagram_no_longer_than_the_window()
+    -> anyhow::Result<()> {
+        let net_cfg = FaultyNetworkConfig {
+            ids_to_drop: HashSet::from_iter([0]),
+            ..Default::default()
+        };
+        let (alice, bob) = setup_alice_bob::<MTU>(net_cfg, None, None);
+        let sock_cfg = SessionSocketConfig {
+            frame_size: FRAME_SIZE,
+            frame_timeout: Duration::from_secs(5),
+            datagram: true,
+            datagram_reorder_window: Some(Duration::from_millis(200)),
+            ..Default::default()
+        };
+        let mut alice_socket = SessionSocket::<MTU, _>::new_stateless(
+            "alice",
+            alice,
+            sock_cfg,
+            #[cfg(feature = "telemetry")]
+            NoopTracker,
+        )?;
+        let mut bob_socket = SessionSocket::<MTU, _>::new_stateless(
+            "bob",
+            bob,
+            sock_cfg,
+            #[cfg(feature = "telemetry")]
+            NoopTracker,
+        )?;
+
+        let started = std::time::Instant::now();
+        for i in 0..3u8 {
+            alice_socket.write_all(&[i; 100]).await?;
+            alice_socket.flush().await?;
+        }
+        let mut buf = [0u8; 100];
+        for expected in 1..3u8 {
+            bob_socket
+                .read_exact(&mut buf)
+                .timeout(futures_time::time::Duration::from_secs(2))
+                .await??;
+            assert_eq!([expected; 100], buf);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a lost datagram must hold the ones behind it for about the window, not frame_timeout: {:?}",
+            started.elapsed()
+        );
         Ok(())
     }
 

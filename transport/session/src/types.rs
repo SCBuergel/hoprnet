@@ -342,6 +342,13 @@ impl HoprSession {
                 // `NoDelay` (UDP-like framing). See `Capability::NoDelay`.
                 let socket_cfg = SessionSocketConfig {
                     datagram: cfg.capabilities.contains(Capability::NoDelay),
+                    // Internal experiment knob until it has a config surface: see
+                    // `SessionSocketConfig::datagram_reorder_window`. Unset or 0 keeps unordered delivery.
+                    datagram_reorder_window: std::env::var("HOPR_SESSION_DATAGRAM_REORDER_WINDOW_MS")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .filter(|ms| *ms > 0)
+                        .map(std::time::Duration::from_millis),
                     ..socket_cfg
                 };
                 debug!(?socket_cfg, "opening new stateless session socket");
