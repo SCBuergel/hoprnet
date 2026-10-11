@@ -312,6 +312,14 @@ where
         {
             planner_config.congestion_delay_reference = Duration::from_millis(ms);
         }
+        // A/B switch for the share of return-path draws made for exploration.
+        if let Some(share) = std::env::var("HOPR_INTERNAL_PATH_RETURN_EXPLORATION")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| (0.0..=1.0).contains(v))
+        {
+            planner_config.return_path_exploration = share;
+        }
         let selector = HoprGraphPathSelector::new(
             me_offchain,
             graph.clone(),

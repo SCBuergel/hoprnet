@@ -776,11 +776,18 @@ where
         );
         // After tempering, so a queue at a relay takes effect at full strength: the temper exists to
         // spread load over relays that look alike, not to keep load on one that is visibly behind.
-        for (weight, (vp, _)) in weights.iter_mut().zip(items.iter()) {
-            if let Some(relay) = vp.len().checked_sub(2).map(|i| &vp[i]) {
-                *weight *= self.relay_congestion_factor(relay);
-            }
+        let congestion: Vec<f64> = items
+            .iter()
+            .map(|(vp, _)| {
+                vp.len()
+                    .checked_sub(2)
+                    .map_or(1.0, |i| self.relay_congestion_factor(&vp[i]))
+            })
+            .collect();
+        for (weight, factor) in weights.iter_mut().zip(congestion.iter()) {
+            *weight *= factor;
         }
+        let congestion_known = congestion.iter().any(|f| *f < 1.0);
 
         if weights.iter().all(|w| *w <= 0.0) {
             return Err(PathPlannerError::Path(PathError::PathNotFound(
@@ -816,7 +823,15 @@ where
         let drawn = (0..count)
             .filter_map(|_| {
                 if should_explore(self.return_path_exploration) {
-                    pick_uniform_index(items.len())
+                    // Exploration exists to keep every candidate's *quality* under observation, so it
+                    // ignores the graph's weights -- but not a queue measured right now: a relay
+                    // that is visibly behind stays measured through probes and forward traffic,
+                    // and exploring through it only adds to the queue that put it there.
+                    if congestion_known {
+                        pick_weighted_index(&congestion)
+                    } else {
+                        pick_uniform_index(items.len())
+                    }
                 } else {
                     pick_weighted_index(&weights)
                 }
