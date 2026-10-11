@@ -178,8 +178,14 @@ impl Lateness {
         }
     }
 
-    /// As [`Self::late_frame`], for an item that knows its frame id only by comparison.
-    fn arrived_after_abandon<T: PartialOrd<FrameId>>(&mut self, item: &T, now: Instant) {
+    /// Whether frame `id`'s gap was given up on and the frame has not turned up since.
+    pub(crate) fn is_abandoned(&self, id: FrameId) -> bool {
+        self.abandoned.iter().any(|(gap, _)| *gap == id)
+    }
+
+    /// As [`Self::late_frame`], for an item that knows its frame id only by comparison; `true` if
+    /// its gap had been given up on.
+    fn arrived_after_abandon<T: PartialOrd<FrameId>>(&mut self, item: &T, now: Instant) -> bool {
         if let Some(pos) = self
             .abandoned
             .iter()
@@ -187,7 +193,9 @@ impl Lateness {
             && let Some((_, since)) = self.abandoned.remove(pos)
         {
             self.sample(now.saturating_duration_since(since));
+            return true;
         }
+        false
     }
 
     fn wait(&self) -> Duration {
@@ -296,12 +304,19 @@ where
                                 }
 
                                 if item.lt(this.next_id) {
-                                    // Do not accept older frame ids
+                                    // A frame whose gap was given up on, turning up after all: an adaptive
+                                    // sequencer delivers it late rather than drop it. Its wait only bounds
+                                    // how long the frames behind a gap are held; it must not turn every
+                                    // frame later than the wait into a loss, which the transport above
+                                    // (TCP in a tunnel) would have to retransmit.
                                     if let Some(lateness) = this.lateness.as_ref()
                                         && let Ok(mut lateness) = lateness.lock()
+                                        && lateness.arrived_after_abandon(&item, Instant::now())
                                     {
-                                        lateness.arrived_after_abandon(&item, Instant::now());
+                                        tracing::trace!("late frame delivered out of order");
+                                        return Poll::Ready(Some(Ok(item)));
                                     }
+                                    // Do not accept older frame ids
                                     tracing::error!("old item");
                                     *this.state = State::Polling;
                                 } else {
@@ -756,8 +771,10 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 seq_sink.unbounded_send(2 * k + 1)?;
             }
-            // Frame 21 is lost; 22 arrives.
+            // Frame 21 is late beyond the wait; 22 arrives, and 21 half a second later.
             seq_sink.unbounded_send(22)?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            seq_sink.unbounded_send(21)?;
             tokio::time::sleep(Duration::from_secs(3)).await;
             anyhow::Ok(seq_sink)
         });
@@ -770,9 +787,11 @@ mod tests {
         let waited = gap_seen.elapsed();
         assert!(
             waited < Duration::from_millis(300),
-            "a lost frame must be given up after about the lateness learned (~20 ms), not the {cap:?} cap: {waited:?}"
+            "a gap must be given up after about the lateness learned (~20 ms), not the {cap:?} cap: {waited:?}"
         );
         assert_eq!(Some(22), seq_stream.try_next().await?);
+        let late = tokio::time::timeout(Duration::from_secs(1), seq_stream.try_next()).await??;
+        assert_eq!(Some(21), late, "a frame later than the wait is delivered late, not lost");
         feeder.abort();
         Ok(())
     }

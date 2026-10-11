@@ -243,10 +243,14 @@ impl<const C: usize> SessionSocket<C, Stateless<C>> {
                             // Filter old frame ids to save space in the Reassembler
                             let last_emitted_id = last_emitted_frame.load(std::sync::atomic::Ordering::Relaxed);
                             if s.frame_id <= last_emitted_id {
-                                if let Some(lateness) = lateness_stage1.as_ref()
-                                    && let Ok(mut lateness) = lateness.lock()
+                                // Segments of a frame whose gap was given up on go on to be reassembled:
+                                // the sequencer delivers the frame late instead of dropping it.
+                                if lateness_stage1
+                                    .as_ref()
+                                    .and_then(|l| l.lock().ok())
+                                    .is_some_and(|l| l.is_abandoned(s.frame_id))
                                 {
-                                    lateness.late_frame(s.frame_id, std::time::Instant::now());
+                                    return true;
                                 }
                                 tracing::warn!(frame_id = s.frame_id, last_emitted_id, "frame already seen");
                                 false
