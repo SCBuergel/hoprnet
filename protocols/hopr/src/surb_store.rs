@@ -270,6 +270,9 @@ pub struct MemorySurbStore {
     /// Relayers this node has lost its connection to. Kept apart from `invalidated_relayers`, so a
     /// reconnect never makes a relayer usable again while its channel is closing.
     unreachable_relayers: Arc<parking_lot::RwLock<std::collections::HashSet<HoprKeyIdent>>>,
+    /// Probability of discarding, when it comes up, a SURB whose return path starts with the relayer;
+    /// see [`MemorySurbStore::set_relayer_skip`].
+    relayer_skip: Arc<parking_lot::RwLock<std::collections::HashMap<HoprKeyIdent, f64>>>,
     reporters: Arc<EvictionReporters>,
     cfg: Arc<SurbStoreConfig>,
 }
@@ -307,6 +310,7 @@ impl MemorySurbStore {
                 .build(),
             invalidated_relayers: Default::default(),
             unreachable_relayers: Default::default(),
+            relayer_skip: Default::default(),
             reporters,
             cfg: cfg.into(),
         }
@@ -323,6 +327,26 @@ impl MemorySurbStore {
     /// when this returns `true`.
     pub fn mark_relayer_unreachable(&self, relayer: &HoprKeyIdent) -> bool {
         self.unreachable_relayers.write().insert(*relayer)
+    }
+
+    /// Sets, per relayer, the probability of discarding a SURB through it when it comes up for use.
+    ///
+    /// The return path of a SURB was chosen when its counterparty minted it -- seconds earlier, given
+    /// the thousands a busy session keeps stored. A relayer that has since become congested still has
+    /// that whole backlog of SURBs routed through it, and the replies sent along them queue behind the
+    /// congestion until the backlog is used up. This node, sending those replies, sees the congestion
+    /// first (its acknowledgements from the relayer lag), so it can skip such SURBs now: the counterparty
+    /// mints more than are used, and a skipped one costs nothing but its place in the buffer. Skipping
+    /// with a probability rather than always keeps a trickle going through the relayer, which is what
+    /// shows when it has recovered. Not applied when SURBs are stored: a relayer congested now may not
+    /// be when the SURB comes up.
+    pub fn set_relayer_skip(&self, skip: std::collections::HashMap<HoprKeyIdent, f64>) {
+        *self.relayer_skip.write() = skip;
+    }
+
+    fn skip_for_congestion(&self, surb: &HoprSurb) -> bool {
+        let p = self.relayer_skip.read().get(&surb.first_relayer).copied().unwrap_or(0.0);
+        p > 0.0 && hopr_api::types::crypto_random::random_float_in_range(0.0..1.0) < p
     }
 
     /// Removes every stored SURB that can no longer be used ([`Self::is_surb_usable`]); returns how many.
@@ -424,7 +448,7 @@ impl SurbStore for MemorySurbStore {
             // SURBs whose return path no longer has a usable first edge are dropped on the way,
             // rather than handed out only to have the reply fail to be paid for.
             SurbMatcher::Pseudonym(_) => surbs_for_pseudonym
-                .pop_next_valid(|_, surb| self.is_surb_usable(surb))
+                .pop_next_valid(|_, surb| self.is_surb_usable(surb) && !self.skip_for_congestion(surb))
                 .map(|popped_surb| FoundSurb {
                     sender_id: HoprSenderId::from_pseudonym_and_id(&pseudonym, popped_surb.id),
                     surb: popped_surb.surb,
@@ -954,6 +978,36 @@ mod tests {
             "no usable SURB should remain"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn memory_surb_store_should_skip_surbs_through_a_congested_relayer_when_they_come_up() -> anyhow::Result<()> {
+        let (congested, clear) = (HoprKeyIdent::from(1u32), HoprKeyIdent::from(2u32));
+        let store = MemorySurbStore::default();
+        let pseudonym = HoprPseudonym::random();
+        store.insert_surbs(
+            pseudonym,
+            vec![
+                ([1u8; 8], surb_via(congested, TWO_HOP)?),
+                ([2u8; 8], surb_via(congested, TWO_HOP)?),
+                ([3u8; 8], surb_via(clear, TWO_HOP)?),
+            ],
+        );
+        store.set_relayer_skip([(congested, 1.0)].into_iter().collect());
+
+        let found = store
+            .find_surb(SurbMatcher::Pseudonym(pseudonym))
+            .ok_or(anyhow::anyhow!("expected the SURB through the clear relayer"))?;
+        assert_eq!([3u8; 8], found.sender_id.surb_id(), "must skip past the congested relayer");
+
+        // Skipping applies when a SURB comes up, not when it is stored.
+        store.set_relayer_skip(Default::default());
+        store.insert_surbs(pseudonym, vec![([4u8; 8], surb_via(congested, TWO_HOP)?)]);
+        let found = store
+            .find_surb(SurbMatcher::Pseudonym(pseudonym))
+            .ok_or(anyhow::anyhow!("a relayer no longer congested must be used again"))?;
+        assert_eq!([4u8; 8], found.sender_id.surb_id());
         Ok(())
     }
 

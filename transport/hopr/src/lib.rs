@@ -170,6 +170,8 @@ pub enum HoprTransportProcess {
     CounterFlush,
     /// Periodically reports SURB round-trip counts into the network graph.
     SurbFlush,
+    #[strum(to_string = "SURB skip by relay congestion")]
+    SurbCongestionSkip,
     #[strum(to_string = "mixer→wire forwarder")]
     MixerForwarder,
     #[cfg(feature = "capture")]
@@ -580,6 +582,41 @@ where
             .unwrap_or(role == protocol::NodeType::Entry);
         if ack_timing {
             self.counters.enable_ack_timing();
+        }
+
+        // A node that sends replies on SURBs (an exit) and times its relays' acknowledgements skips SURBs
+        // through relays its acknowledgements show congested; see `MemorySurbStore::set_relayer_skip`.
+        if ack_timing && role != protocol::NodeType::Entry {
+            let counters = self.counters.clone();
+            let surb_store = self.path_planner.surb_store.clone();
+            let chain_api = self.chain_api.clone();
+            let reference = self.path_planner.congestion_delay_reference();
+            processes.insert(
+                HoprTransportProcess::SurbCongestionSkip,
+                hopr_utils::spawn_as_abortable!(async move {
+                    use hopr_api::chain::KeyIdMapping;
+                    loop {
+                        futures_timer::Delay::new(Duration::from_millis(250)).await;
+                        let links = counters.congestions();
+                        let least = links
+                            .iter()
+                            .filter_map(|(_, l)| l.queueing)
+                            .min()
+                            .filter(|_| links.iter().filter(|(_, l)| l.queueing.is_some()).count() >= 2)
+                            .unwrap_or_default();
+                        let skip = links
+                            .into_iter()
+                            .filter_map(|(peer, mut link)| {
+                                link.queueing = link.queueing.map(|q| q.saturating_sub(least));
+                                let p = (1.0 - crate::path::planner::link_factor(&link, reference)).clamp(0.0, 0.95);
+                                let id = chain_api.key_id_mapper_ref().map_key_to_id(&peer)?;
+                                (p > 0.05).then_some((id, p))
+                            })
+                            .collect();
+                        surb_store.set_relayer_skip(skip);
+                    }
+                }),
+            );
         }
 
         let (unresolved_routing_msg_tx, unresolved_routing_msg_rx) =

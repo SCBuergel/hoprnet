@@ -538,7 +538,7 @@ const CONGESTION_LOSS_REFERENCE: f64 = 0.05;
 
 /// Share of the draws a path keeps for the link through its relay: the queueing and the loss
 /// factor together. Neutral on what is not known.
-fn link_factor(link: &crate::protocol::LinkCongestion, delay_reference: Duration) -> f64 {
+pub(crate) fn link_factor(link: &crate::protocol::LinkCongestion, delay_reference: Duration) -> f64 {
     let delay = link.queueing.map_or(1.0, |q| congestion_factor(q, delay_reference));
     let loss = link.loss.map_or(1.0, |l| {
         let x = l / CONGESTION_LOSS_REFERENCE;
@@ -582,6 +582,12 @@ where
                 .congestion_integral
                 .then(|| Arc::new(std::sync::Mutex::new(RelayWeights::default()))),
         }
+    }
+
+    /// The queueing delay at which a relay's draws are halved; see
+    /// [`PathPlannerConfig::congestion_delay_reference`].
+    pub fn congestion_delay_reference(&self) -> Duration {
+        self.congestion_delay_reference
     }
 
     /// Draws paths away from relays whose acknowledgements show a queue or loss, using the per-peer
