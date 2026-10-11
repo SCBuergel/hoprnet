@@ -304,7 +304,14 @@ where
         cfg: HoprProtocolConfig,
     ) -> errors::Result<Self> {
         let me_offchain = *identity.1.public();
-        let planner_config = cfg.path_planner;
+        let mut planner_config = cfg.path_planner;
+        // A/B switch for the congestion-aware draw: the reference queueing delay in ms, 0 disables.
+        if let Some(ms) = std::env::var("HOPR_INTERNAL_PATH_CONGESTION_DELAY_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            planner_config.congestion_delay_reference = Duration::from_millis(ms);
+        }
         let selector = HoprGraphPathSelector::new(
             me_offchain,
             graph.clone(),
@@ -352,13 +359,17 @@ where
 
         // Built before the session manager so the latter can be handed the seam that lets a
         // session re-plan its return path on sustained loss.
+        // One registry for the conformance counters and the planner: the acknowledgement delays the
+        // packet pipeline records into it are what the planner draws paths away from congestion by.
+        let counters = PeerProtocolCounterRegistry::default();
         let path_planner = PathPlanner::new(
             me_offchain,
             MemorySurbStore::new(surb_store_cfg),
             resolver.clone(),
             selector,
             planner_config,
-        );
+        )
+        .with_congestion(counters.clone());
 
         Ok(Self {
             packet_key: identity.1.clone(),
@@ -404,7 +415,7 @@ where
             chain_api: resolver,
             session_telemetry_tag_allocator,
             probing_tag_allocator,
-            counters: PeerProtocolCounterRegistry::default(),
+            counters,
             cfg,
         })
     }

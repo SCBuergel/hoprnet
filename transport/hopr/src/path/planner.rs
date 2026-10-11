@@ -144,6 +144,21 @@ pub struct PathPlannerConfig {
     /// instead of poisoning the latency EMA with an absurd value.
     #[default(Duration::from_secs(30))]
     pub max_plausible_loopback_rtt: Duration,
+    /// Queueing delay at a relay at which its paths are drawn at half their weight.
+    ///
+    /// Path weights come from probes, acknowledgement rates and SURB round-trips, and none of them
+    /// sees a relay that is merely slow: a relay whose outgoing link is saturated still answers
+    /// every probe and acknowledges every packet, a fraction of a second late. Drawn at its full
+    /// weight it gets its full share of a session's packets, and a session whose packets wait on the
+    /// slowest of its relays moves at that relay's pace (one relay of ten capped to 1 Mbit/s took
+    /// a 10 Mbit/s tunnel down to 1.2).
+    ///
+    /// Every draw therefore scales a path's weight by `1 / (1 + (q / reference)²)`, where `q` is
+    /// how far the acknowledgements of the relay next to this node lag behind their recent floor
+    /// (see `PeerProtocolCounters::queueing_delay`). It applies at draw time, so it follows a queue
+    /// within about a second rather than at the next cache refresh. Zero disables it.
+    #[default(Duration::from_millis(50))]
+    pub congestion_delay_reference: Duration,
 }
 
 fn validate_unit_interval(value: f64) -> std::result::Result<(), ValidationError> {
@@ -445,6 +460,18 @@ pub struct PathPlanner<Surb, R, S> {
     weighting: WeightingParams,
     return_path_weight_temper: f64,
     return_path_exploration: f64,
+    congestion: Option<crate::protocol::PeerProtocolCounterRegistry>,
+    congestion_delay_reference: Duration,
+}
+
+/// Share of the draws a path keeps when the relay next to this node queues `queueing` on top of
+/// its floor; see [`PathPlannerConfig::congestion_delay_reference`].
+fn congestion_factor(queueing: Duration, reference: Duration) -> f64 {
+    if reference.is_zero() {
+        return 1.0;
+    }
+    let x = queueing.as_secs_f64() / reference.as_secs_f64();
+    1.0 / (1.0 + x * x)
 }
 
 impl<Surb, R, S> PathPlanner<Surb, R, S>
@@ -475,7 +502,41 @@ where
             },
             return_path_weight_temper: config.return_path_weight_temper,
             return_path_exploration: config.return_path_exploration,
+            congestion: None,
+            congestion_delay_reference: config.congestion_delay_reference,
         }
+    }
+
+    /// Draws paths away from relays whose acknowledgements show a queue, using the per-peer
+    /// acknowledgement delays the packet pipeline records in `registry`.
+    pub fn with_congestion(mut self, registry: crate::protocol::PeerProtocolCounterRegistry) -> Self {
+        self.congestion = Some(registry);
+        self
+    }
+
+    /// The draw weight multiplier for paths whose hop next to this node is `relay`.
+    fn relay_congestion_factor(&self, relay: &OffchainPublicKey) -> f64 {
+        match &self.congestion {
+            Some(registry) if !self.congestion_delay_reference.is_zero() => registry
+                .queueing_delay(relay)
+                .map_or(1.0, |q| congestion_factor(q, self.congestion_delay_reference)),
+            _ => 1.0,
+        }
+    }
+
+    /// Picks one of `paths` from this node, its weight scaled by the congestion at its first hop.
+    fn pick_forward(&self, paths: &hopr_utils::statistics::WeightedCollection<ValidatedPath>) -> Option<ValidatedPath> {
+        if self.congestion.is_none() || self.congestion_delay_reference.is_zero() {
+            return paths.pick_one();
+        }
+        let items: Vec<&(ValidatedPath, f64)> = paths.iter().collect();
+        let weights: Vec<f64> = items
+            .iter()
+            .map(|(vp, w)| w.max(0.0) * vp.first().map_or(1.0, |relay| self.relay_congestion_factor(relay)))
+            .collect();
+        pick_weighted_index(&weights)
+            .map(|i| items[i].0.clone())
+            .or_else(|| paths.pick_one())
     }
 
     /// Resolve a [`NodeId`] to an [`OffchainPublicKey`].
@@ -535,7 +596,12 @@ where
 
                 // Format from the `NodeId`s rather than re-resolving them: `cached_paths` has
                 // already done that, and for `NodeId::Chain` each resolution is a resolver lookup.
-                paths.pick_one().ok_or_else(|| {
+                let picked = if source == NodeId::Offchain(self.me) {
+                    self.pick_forward(&paths)
+                } else {
+                    paths.pick_one()
+                };
+                picked.ok_or_else(|| {
                     PathPlannerError::Path(PathError::PathNotFound(
                         hops_usize,
                         source.to_string(),
@@ -704,10 +770,17 @@ where
 
         let candidates = self.cached_paths(destination, me, hops).await?;
         let items: Vec<&(ValidatedPath, f64)> = candidates.iter().collect();
-        let weights = temper_weights(
+        let mut weights = temper_weights(
             &items.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
             self.return_path_weight_temper,
         );
+        // After tempering, so a queue at a relay takes effect at full strength: the temper exists to
+        // spread load over relays that look alike, not to keep load on one that is visibly behind.
+        for (weight, (vp, _)) in weights.iter_mut().zip(items.iter()) {
+            if let Some(relay) = vp.len().checked_sub(2).map(|i| &vp[i]) {
+                *weight *= self.relay_congestion_factor(relay);
+            }
+        }
 
         if weights.iter().all(|w| *w <= 0.0) {
             return Err(PathPlannerError::Path(PathError::PathNotFound(
@@ -864,6 +937,8 @@ where
         let refresh_period = self.refresh_period;
         let weighting = self.weighting;
         let me = self.me;
+        let congestion = self.congestion.clone().filter(|_| !self.congestion_delay_reference.is_zero());
+        let congestion_reference = self.congestion_delay_reference;
 
         // run at a non-zero interval
         futures_time::stream::interval(futures_time::time::Duration::from_millis(
@@ -874,8 +949,22 @@ where
             let resolver = resolver.clone();
             let selector = selector.clone();
             let weighting = weighting;
+            let congestion = congestion.clone();
 
             async move {
+                if let Some(registry) = congestion {
+                    for (peer, smoothed, floor) in registry.ack_delays() {
+                        let queueing = smoothed.saturating_sub(floor);
+                        tracing::debug!(
+                            %peer,
+                            smoothed_ms = smoothed.as_millis() as u64,
+                            floor_ms = floor.as_millis() as u64,
+                            queueing_ms = queueing.as_millis() as u64,
+                            factor = congestion_factor(queueing, congestion_reference),
+                            "relay acknowledgement delay"
+                        );
+                    }
+                }
                 for (key, swept) in cache.iter() {
                     let (src_key, dest_key, hops_u32) = {
                         let k = key.as_ref();
@@ -1865,6 +1954,109 @@ mod tests {
             cfg,
         );
         (planner, graph)
+    }
+
+    /// Draws `n` return paths one at a time and counts how many went through `relayer`.
+    async fn return_draws_through(planner: &TestPlanner, relayer: &OffchainPublicKey, n: usize) -> usize {
+        let mut through = 0;
+        for _ in 0..n {
+            let drawn = planner
+                .resolve_diverse_return_paths(
+                    NodeId::Offchain(pubkey(&SECRET_DEST)),
+                    RoutingOptions::Hops(1.try_into().expect("valid 1")),
+                    1,
+                )
+                .await
+                .expect("return path resolution should succeed");
+            through += drawn.iter().filter(|vp| vp.first() == Some(relayer)).count();
+        }
+        through
+    }
+
+    #[test]
+    fn congestion_factor_should_halve_at_the_reference_and_fall_off_beyond() {
+        let reference = Duration::from_millis(50);
+        assert_eq!(congestion_factor(Duration::ZERO, reference), 1.0);
+        assert!((congestion_factor(reference, reference) - 0.5).abs() < 1e-9);
+        assert!(congestion_factor(Duration::from_millis(150), reference) < 0.11);
+        assert_eq!(
+            congestion_factor(Duration::from_secs(5), Duration::ZERO),
+            1.0,
+            "a zero reference disables it"
+        );
+    }
+
+    /// The return draw must steer away from a relayer whose acknowledgements show a queue, however
+    /// good the graph says it is: probes and acknowledgement rates do not see a slow relay at all.
+    #[tokio::test]
+    async fn return_draws_should_move_away_from_a_relayer_that_queues() {
+        let (planner, _graph) = two_relayer_return_planner();
+        let registry = crate::protocol::PeerProtocolCounterRegistry::default();
+        let planner = planner.with_congestion(registry.clone());
+        let a = pubkey(&SECRET_A);
+        let b = pubkey(&SECRET_B);
+        for relayer in [a, b] {
+            registry.set_ack_delay_for_test(&relayer, Duration::from_millis(120), Duration::from_millis(120));
+        }
+
+        let even = return_draws_through(&planner, &a, 2000).await;
+        assert!((800..1200).contains(&even), "without a queue the two share the draws: {even} of 2000");
+
+        // 150 ms above its floor: weight × 1/(1 + 3²) = 0.1, plus the uniform exploration share.
+        registry.set_ack_delay_for_test(&a, Duration::from_millis(270), Duration::from_millis(120));
+        let congested = return_draws_through(&planner, &a, 2000).await;
+        assert!(
+            congested < 300,
+            "a queueing relayer must lose most of its draws: {congested} of 2000"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_draws_should_move_away_from_a_first_hop_that_queues() -> anyhow::Result<()> {
+        let me = pubkey(&SECRET_ME);
+        let a = pubkey(&SECRET_A);
+        let b = pubkey(&SECRET_B);
+        let dest = pubkey(&SECRET_DEST);
+        let graph = ChannelGraph::new(me);
+        for node in [a, b, dest] {
+            graph.add_node(node);
+        }
+        for (src, dst) in [(me, a), (a, dest), (me, b), (b, dest)] {
+            graph.add_edge(&src, &dst).expect("edge should be addable");
+            mark_edge_full(&graph, &src, &dst);
+        }
+        let cfg = small_config();
+        let selector = HoprGraphPathSelector::new(
+            me,
+            graph.clone(),
+            cfg.max_cached_paths,
+            cfg.edge_penalty,
+            cfg.min_ack_rate,
+            cfg.min_paths_anonymity_floor,
+        );
+        let chain_api = TestChainApi::new(me, me_addr(), vec![(a, a_addr()), (b, b_addr()), (dest, dest_addr())])
+            .with_open_channel(me_addr(), a_addr())
+            .with_open_channel(a_addr(), dest_addr())
+            .with_open_channel(me_addr(), b_addr())
+            .with_open_channel(b_addr(), dest_addr());
+        let registry = crate::protocol::PeerProtocolCounterRegistry::default();
+        let planner = PathPlanner::new(me, hopr_protocol_hopr::MemorySurbStore::default(), chain_api, selector, cfg)
+            .with_congestion(registry.clone());
+        registry.set_ack_delay_for_test(&a, Duration::from_millis(270), Duration::from_millis(120));
+
+        let mut through_a = 0;
+        for _ in 0..2000 {
+            let path = planner
+                .resolve_path(
+                    NodeId::Offchain(pubkey(&SECRET_ME)),
+                    NodeId::Offchain(pubkey(&SECRET_DEST)),
+                    RoutingOptions::Hops(1.try_into().expect("valid 1")),
+                )
+                .await?;
+            through_a += usize::from(path.first() == Some(&a));
+        }
+        assert!(through_a < 400, "a queueing first hop must lose most of its draws: {through_a} of 2000");
+        Ok(())
     }
 
     /// Populates the return-path cache the way a Session does and hands back the cached entry.
