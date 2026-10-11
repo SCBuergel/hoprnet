@@ -211,6 +211,15 @@ impl<const C: usize> SessionSocket<C, Stateless<C>> {
         let last_emitted_frame = Arc::new(AtomicU32::new(0));
         let last_emitted_frame_clone = last_emitted_frame.clone();
 
+        // A datagram session with a reorder window learns how long to wait from how late frames are.
+        // Frames that come after their gap was given up are dropped right below, before the sequencer
+        // sees them, so the drop reports them to the shared estimate.
+        let lateness: Option<crate::processing::SharedLateness> = cfg
+            .datagram_reorder_window
+            .filter(|_| cfg.datagram)
+            .map(|cap| Arc::new(std::sync::Mutex::new(crate::processing::Lateness::new(cap))));
+        let lateness_stage1 = lateness.clone();
+
         // Debug tracing spans for individual pipeline stages
         let stage1_span = tracing::debug_span!("SessionSocket::packets_in::pre_reassembly", session_id = %id);
         let stage2_span = tracing::debug_span!("SessionSocket::packets_in::pre_sequencing", session_id = %id);
@@ -234,6 +243,11 @@ impl<const C: usize> SessionSocket<C, Stateless<C>> {
                             // Filter old frame ids to save space in the Reassembler
                             let last_emitted_id = last_emitted_frame.load(std::sync::atomic::Ordering::Relaxed);
                             if s.frame_id <= last_emitted_id {
+                                if let Some(lateness) = lateness_stage1.as_ref()
+                                    && let Ok(mut lateness) = lateness.lock()
+                                {
+                                    lateness.late_frame(s.frame_id, std::time::Instant::now());
+                                }
                                 tracing::warn!(frame_id = s.frame_id, last_emitted_id, "frame already seen");
                                 false
                             } else {
@@ -328,16 +342,19 @@ impl<const C: usize> SessionSocket<C, Stateless<C>> {
                 (true, Some(window)) => (window, None),
                 _ => (cfg.frame_timeout, cfg.max_frame_age),
             };
-            reassembled
-                // Put the frames into the correct sequence by Frame Ids
-                .sequencer_with(crate::processing::SequencerConfig {
-                    max_wait,
-                    capacity: cfg.capacity,
-                    max_item_age,
-                    max_frames_behind_gap: cfg.max_frames_behind_gap,
-                    // A datagram session's window is a cap; the wait follows how late frames are.
-                    adaptive_wait: cfg.datagram && cfg.datagram_reorder_window.is_some(),
-                })
+            let seq_cfg = crate::processing::SequencerConfig {
+                max_wait,
+                capacity: cfg.capacity,
+                max_item_age,
+                max_frames_behind_gap: cfg.max_frames_behind_gap,
+                adaptive_wait: false,
+            };
+            // A datagram session's window is a cap; the wait follows how late frames are.
+            let sequenced = match lateness {
+                Some(lateness) => reassembled.sequencer_with_lateness(seq_cfg, lateness),
+                None => reassembled.sequencer_with(seq_cfg),
+            };
+            sequenced
                 // Discard frames missing from the sequence
                 .filter_map(move |maybe_frame| {
                     let _span = stage3_span.enter();
