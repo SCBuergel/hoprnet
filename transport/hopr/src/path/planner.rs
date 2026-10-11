@@ -474,6 +474,24 @@ fn congestion_factor(queueing: Duration, reference: Duration) -> f64 {
     1.0 / (1.0 + x * x)
 }
 
+/// Loss share at which a relay's paths are drawn at half their weight.
+///
+/// A loss share well above the background of the links (a fraction of a percent) is a relay that
+/// cannot keep up -- its queue overflows -- or one that stopped forwarding. Five percent is ten
+/// to twenty times what the 0.25 %-loss links of the netem test show through a healthy relay.
+const CONGESTION_LOSS_REFERENCE: f64 = 0.05;
+
+/// Share of the draws a path keeps for the link through its relay: the queueing and the loss
+/// factor together. Neutral on what is not known.
+fn link_factor(link: &crate::protocol::LinkCongestion, delay_reference: Duration) -> f64 {
+    let delay = link.queueing.map_or(1.0, |q| congestion_factor(q, delay_reference));
+    let loss = link.loss.map_or(1.0, |l| {
+        let x = l / CONGESTION_LOSS_REFERENCE;
+        1.0 / (1.0 + x * x)
+    });
+    delay * loss
+}
+
 impl<Surb, R, S> PathPlanner<Surb, R, S>
 where
     Surb: SurbStore + Send + Sync + 'static,
@@ -507,8 +525,8 @@ where
         }
     }
 
-    /// Draws paths away from relays whose acknowledgements show a queue, using the per-peer
-    /// acknowledgement delays the packet pipeline records in `registry`.
+    /// Draws paths away from relays whose acknowledgements show a queue or loss, using the per-peer
+    /// acknowledgement timing the packet pipeline records in `registry`.
     pub fn with_congestion(mut self, registry: crate::protocol::PeerProtocolCounterRegistry) -> Self {
         self.congestion = Some(registry);
         self
@@ -517,9 +535,9 @@ where
     /// The draw weight multiplier for paths whose hop next to this node is `relay`.
     fn relay_congestion_factor(&self, relay: &OffchainPublicKey) -> f64 {
         match &self.congestion {
-            Some(registry) if !self.congestion_delay_reference.is_zero() => registry
-                .queueing_delay(relay)
-                .map_or(1.0, |q| congestion_factor(q, self.congestion_delay_reference)),
+            Some(registry) if !self.congestion_delay_reference.is_zero() => {
+                link_factor(&registry.congestion(relay), self.congestion_delay_reference)
+            }
             _ => 1.0,
         }
     }
@@ -968,14 +986,14 @@ where
 
             async move {
                 if let Some(registry) = congestion {
-                    for (peer, smoothed, floor) in registry.ack_delays() {
-                        let queueing = smoothed.saturating_sub(floor);
+                    for (peer, link) in registry.congestions() {
                         tracing::debug!(
                             %peer,
-                            smoothed_ms = smoothed.as_millis() as u64,
-                            floor_ms = floor.as_millis() as u64,
-                            queueing_ms = queueing.as_millis() as u64,
-                            factor = congestion_factor(queueing, congestion_reference),
+                            smoothed_ms = link.delay.map(|(s, _)| s.as_millis() as u64),
+                            floor_ms = link.delay.map(|(_, f)| f.as_millis() as u64),
+                            queueing_ms = link.queueing.map(|q| q.as_millis() as u64),
+                            loss = link.loss,
+                            factor = link_factor(&link, congestion_reference),
                             "relay acknowledgement delay"
                         );
                     }
@@ -2024,6 +2042,17 @@ mod tests {
             congested < 300,
             "a queueing relayer must lose most of its draws: {congested} of 2000"
         );
+    }
+
+    #[tokio::test]
+    async fn return_draws_should_move_away_from_a_relayer_that_loses_packets() {
+        let (planner, _graph) = two_relayer_return_planner();
+        let registry = crate::protocol::PeerProtocolCounterRegistry::default();
+        let planner = planner.with_congestion(registry.clone());
+        let a = pubkey(&SECRET_A);
+        registry.set_loss_for_test(&a, 0.2);
+        let lossy = return_draws_through(&planner, &a, 2000).await;
+        assert!(lossy < 300, "a relayer losing a fifth of its packets must lose most of its draws: {lossy} of 2000");
     }
 
     #[tokio::test]

@@ -565,6 +565,16 @@ where
     {
         let mut processes = AbortableList::<HoprTransportProcess>::default();
 
+        // The entry of a session is the node that draws its paths, so it is the one that times its
+        // relays' acknowledgements (HOPR_INTERNAL_ACK_TIMING=0/1 overrides).
+        let ack_timing = std::env::var("HOPR_INTERNAL_ACK_TIMING")
+            .ok()
+            .map(|v| v.trim() == "1")
+            .unwrap_or(role == protocol::NodeType::Entry);
+        if ack_timing {
+            self.counters.enable_ack_timing();
+        }
+
         let (unresolved_routing_msg_tx, unresolved_routing_msg_rx) =
             bounded_sink_channel::<(DestinationRouting, ApplicationDataOut)>(MAXIMUM_MSG_OUTGOING_BUFFER_SIZE);
 

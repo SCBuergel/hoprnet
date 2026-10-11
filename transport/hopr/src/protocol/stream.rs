@@ -60,6 +60,10 @@ struct PeerSink<T: Send + 'static> {
     /// channel when the stream is `ready`; while still opening it uses non-blocking drop-newest,
     /// so a slow open for one peer never head-of-line-blocks other peers.
     ready: Arc<AtomicBool>,
+    /// Packets for this peer that found its channel full, waiting for space in a task of their own;
+    /// see [`EGRESS_OVERFLOW_CAPACITY`]. `Some` while that task runs, and then every packet for this
+    /// peer goes there, so none overtakes another.
+    overflow: Arc<std::sync::Mutex<Option<futures::channel::mpsc::Sender<T>>>>,
 }
 
 impl<T: Send + 'static> PeerSink<T> {
@@ -68,9 +72,21 @@ impl<T: Send + 'static> PeerSink<T> {
             tx,
             token: Arc::new(()),
             ready: Arc::new(AtomicBool::new(false)),
+            overflow: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
+
+/// Packets a peer whose channel is full may have waiting beside it; past this they are dropped.
+///
+/// The egress drain feeds every peer from one queue. It used to wait for space in a full channel
+/// right there, so a slow peer paced every other peer: a relay on a saturated link drains a few
+/// dozen packets a second, the drain waited for a slot for each packet bound there, and the rest
+/// queued behind it (with a client's probes alone and several relays slowed that way, the drain
+/// was blocked nearly all the time and the client's tunnel stopped sending altogether). The wait
+/// now happens in a task per peer, so it still absorbs a burst without loss and still applies the
+/// backpressure timeout, but only to that peer's own packets.
+const EGRESS_OVERFLOW_CAPACITY: usize = 1024;
 
 type PeerStreamCache<T> = moka::sync::Cache<PeerId, PeerSink<T>>;
 
@@ -460,39 +476,86 @@ where
                 })
             };
 
+            // While a peer has packets waiting for space, its new ones join them, in order.
+            let msg = {
+                let mut overflow = sink.overflow.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(waiting) = overflow.as_mut() {
+                    match waiting.try_send(msg) {
+                        Ok(()) => continue,
+                        Err(e) if e.is_full() => {
+                            #[cfg(all(feature = "telemetry", not(test)))]
+                            METRIC_RING_BUFFER_DROPPED.increment();
+                            tracing::trace!(%peer, "per-peer egress overflow full; dropping newest packet");
+                            continue;
+                        }
+                        Err(e) => {
+                            *overflow = None;
+                            e.into_inner()
+                        }
+                    }
+                } else {
+                    msg
+                }
+            };
+
             match sink.tx.try_send(msg) {
                 Ok(()) => tracing::trace!(%peer, "message queued to peer channel"),
                 Err(crossfire::TrySendError::Full(msg)) => {
                     if sink.ready.load(Ordering::Relaxed) {
-                        // Stream is open and draining; a full channel means the wire is slower
-                        // than the producer. Wait (bounded) for space so wire-rate backpressure
-                        // propagates upstream — through the mixer, the outgoing CrossfireSink and
-                        // the session socket — to the application writer, instead of dropping.
-                        // Fall back to drop-newest only if the peer stays full past the timeout,
-                        // so a stalled peer cannot head-of-line-block other peers forever.
-                        use futures_time::future::FutureExt as _;
-                        match async { sink.tx.send(msg).await }
-                            .timeout(futures_time::time::Duration::from(egress_backpressure_timeout))
-                            .await
-                        {
-                            Ok(Ok(())) => {
-                                tracing::trace!(%peer, "message queued to peer channel after backpressure")
-                            }
-                            Ok(Err(_disconnected)) => {
-                                tracing::debug!(%peer, "peer sink disconnected while awaiting space; invalidating cache");
-                                if cache_out.get(&peer).is_some_and(|s| Arc::ptr_eq(&s.token, &sink.token)) {
-                                    cache_out.invalidate(&peer);
+                        // Stream is open and draining; a full channel means the wire is slower than
+                        // the producer. Wait (bounded) for space -- but in a task of this peer's own,
+                        // so the wait never holds back the packets of other peers. See
+                        // EGRESS_OVERFLOW_CAPACITY.
+                        let (mut overflow_tx, mut overflow_rx) =
+                            futures::channel::mpsc::channel::<<C as Decoder>::Item>(EGRESS_OVERFLOW_CAPACITY);
+                        let _ = overflow_tx.try_send(msg);
+                        *sink.overflow.lock().unwrap_or_else(|e| e.into_inner()) = Some(overflow_tx);
+                        let overflow = sink.overflow.clone();
+                        let tx = sink.tx.clone();
+                        let cache = cache_out.clone();
+                        let token = sink.token.clone();
+                        hopr_utils::runtime::prelude::spawn(async move {
+                            use futures_time::future::FutureExt as _;
+                            loop {
+                                // Taken under the lock, and the overflow closed under it once empty, so
+                                // the drain never adds to a queue nobody is emptying. Closed only after
+                                // the last packet is in the channel, so nothing overtakes it.
+                                let next = {
+                                    let mut guard = overflow.lock().unwrap_or_else(|e| e.into_inner());
+                                    match overflow_rx.try_recv() {
+                                        Ok(next) => next,
+                                        _ => {
+                                            *guard = None;
+                                            break;
+                                        }
+                                    }
+                                };
+                                match async { tx.send(next).await }
+                                    .timeout(futures_time::time::Duration::from(egress_backpressure_timeout))
+                                    .await
+                                {
+                                    Ok(Ok(())) => {
+                                        tracing::trace!(%peer, "message queued to peer channel after backpressure")
+                                    }
+                                    Ok(Err(_disconnected)) => {
+                                        tracing::debug!(%peer, "peer sink disconnected while awaiting space; invalidating cache");
+                                        *overflow.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                                        if cache.get(&peer).is_some_and(|s| Arc::ptr_eq(&s.token, &token)) {
+                                            cache.invalidate(&peer);
+                                        }
+                                        break;
+                                    }
+                                    Err(_timeout) => {
+                                        #[cfg(all(feature = "telemetry", not(test)))]
+                                        METRIC_RING_BUFFER_DROPPED.increment();
+                                        tracing::debug!(
+                                            %peer,
+                                            "per-peer egress channel full past backpressure timeout; dropping newest packet"
+                                        );
+                                    }
                                 }
                             }
-                            Err(_timeout) => {
-                                #[cfg(all(feature = "telemetry", not(test)))]
-                                METRIC_RING_BUFFER_DROPPED.increment();
-                                tracing::debug!(
-                                    %peer,
-                                    "per-peer egress channel full past backpressure timeout; dropping newest packet"
-                                );
-                            }
-                        }
+                        });
                     } else {
                         // Stream still opening: never block — a slow open for this peer must not
                         // head-of-line-block delivery to other peers. Drop newest and yield so the
@@ -1335,6 +1398,145 @@ mod tests {
             msg.len(),
         );
 
+        Ok(())
+    }
+
+    /// A writer that accepts one write per `interval`: a peer that keeps up, only slowly.
+    #[derive(Clone, Debug)]
+    struct SlowWriteIo {
+        interval: std::time::Duration,
+        next_at: Arc<Mutex<std::time::Instant>>,
+        written: Arc<AtomicUsize>,
+    }
+
+    impl SlowWriteIo {
+        fn new(interval: std::time::Duration) -> Self {
+            Self {
+                interval,
+                next_at: Arc::new(Mutex::new(std::time::Instant::now())),
+                written: Default::default(),
+            }
+        }
+    }
+
+    impl AsyncRead for SlowWriteIo {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>, _buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for SlowWriteIo {
+        fn poll_write(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            let now = std::time::Instant::now();
+            let mut next_at = self.next_at.lock();
+            if now >= *next_at {
+                *next_at = now + self.interval;
+                self.written.fetch_add(buf.len(), Ordering::Relaxed);
+                Poll::Ready(Ok(buf.len()))
+            } else {
+                let waker = cx.waker().clone();
+                let wait = *next_at - now;
+                tokio::spawn(async move {
+                    tokio::time::sleep(wait).await;
+                    waker.wake();
+                });
+                Poll::Pending
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct SlowPeerControl {
+        slow_peer: PeerId,
+        slow_io: SlowWriteIo,
+        healthy_io: GatedWriteIo,
+    }
+
+    #[async_trait]
+    impl hopr_api::network::traits::NetworkStreamControl for SlowPeerControl {
+        fn accept(
+            self,
+        ) -> Result<impl Stream<Item = (PeerId, impl AsyncRead + AsyncWrite + Send)> + Send, impl std::error::Error>
+        {
+            Ok::<_, std::io::Error>(futures::stream::empty::<(PeerId, GatedWriteIo)>())
+        }
+
+        async fn open(self, peer: PeerId) -> Result<impl AsyncRead + AsyncWrite + Send, impl std::error::Error> {
+            Ok::<_, std::io::Error>(if peer == self.slow_peer {
+                futures::future::Either::Left(self.slow_io.clone())
+            } else {
+                futures::future::Either::Right(self.healthy_io.clone())
+            })
+        }
+    }
+
+    /// A peer that is slow but alive must not pace the others. Under the old drain every packet bound
+    /// for the slow peer, once its channel was full, held the shared drain until a slot freed -- one
+    /// write interval each -- so the healthy peer's packets, interleaved with them, came out at the
+    /// slow peer's rate.
+    #[tokio::test]
+    async fn slow_peer_must_not_pace_a_healthy_peer() -> anyhow::Result<()> {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+        const N: usize = 60;
+
+        let slow_peer = PeerId::random();
+        let healthy_peer = PeerId::random();
+        let slow_io = SlowWriteIo::new(INTERVAL);
+        let healthy_io = GatedWriteIo {
+            open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ..Default::default()
+        };
+        let control = SlowPeerControl {
+            slow_peer,
+            slow_io: slow_io.clone(),
+            healthy_io: healthy_io.clone(),
+        };
+        let (mut tx_out, _rx_in) = process_stream_protocol(
+            BytesCodec::new(),
+            control,
+            crate::config::StreamProtocolConfig {
+                per_peer_channel_capacity: 2,
+                frame_writer_backpressure_bytes: 1,
+                egress_backpressure_timeout: std::time::Duration::from_secs(2),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let msg = BytesMut::from(&b"hello"[..]);
+        // Open both streams first, so the slow peer's channel is ready when the burst comes.
+        tx_out.send((slow_peer, msg.clone())).await?;
+        tx_out.send((healthy_peer, msg.clone())).await?;
+        anyhow::ensure!(
+            wait_for(2, || healthy_io.written() >= msg.len() && slow_io.written.load(Ordering::Relaxed) >= msg.len()).await,
+            "both streams must open"
+        );
+
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            tx_out.send((slow_peer, msg.clone())).await?;
+            tx_out.send((healthy_peer, msg.clone())).await?;
+        }
+        let all_healthy = (N + 1) * msg.len();
+        anyhow::ensure!(
+            wait_for(2, || healthy_io.written() >= all_healthy).await,
+            "the healthy peer got {} of {all_healthy} bytes",
+            healthy_io.written()
+        );
+        // At the slow peer's pace the healthy packets would take N x INTERVAL = 3 s.
+        assert!(
+            started.elapsed() < N as u32 * INTERVAL / 4,
+            "the healthy peer was paced by the slow one: {:?}",
+            started.elapsed()
+        );
         Ok(())
     }
 

@@ -2,13 +2,13 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
-use hopr_api::types::crypto::types::OffchainPublicKey;
+use hopr_api::types::crypto::types::{HalfKey, HalfKeyChallenge, OffchainPublicKey};
 
 /// Minimal atomic counters for per-peer protocol conformance tracking.
 ///
@@ -26,20 +26,29 @@ impl PeerProtocolCounters {
     #[inline]
     pub fn record_message_sent(&self) {
         self.messages_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a message awaiting the acknowledgement that solves `challenge` was sent now.
+    pub fn record_awaiting_ack(&self, challenge: HalfKeyChallenge) {
         if let Ok(mut delay) = self.ack_delay.lock() {
-            delay.sent(Instant::now());
+            delay.sent(challenge, Instant::now());
         }
     }
 
-    /// How much longer this peer's acknowledgements currently take than they did at their fastest
-    /// lately; `None` without recent evidence. See [`AckDelay`].
-    pub fn queueing_delay(&self) -> Option<Duration> {
-        self.ack_delay.lock().ok().and_then(|delay| delay.queueing_delay(Instant::now()))
+    /// Record that acknowledgements solving `challenges` arrived at `at`, in one batch.
+    pub fn record_acked(&self, challenges: &[HalfKeyChallenge], at: Instant) {
+        if let Ok(mut delay) = self.ack_delay.lock() {
+            delay.acked(challenges, at);
+        }
     }
 
-    /// The smoothed acknowledgement delay and its recent floor, for diagnostics.
-    pub fn ack_delay_estimate(&self) -> Option<(Duration, Duration)> {
-        self.ack_delay.lock().ok().and_then(|delay| delay.estimate(Instant::now()))
+    /// This peer's current queueing delay and loss, as its acknowledgements show them. See
+    /// [`LinkCongestion`].
+    pub fn congestion(&self) -> LinkCongestion {
+        self.ack_delay
+            .lock()
+            .map(|delay| delay.congestion(Instant::now()))
+            .unwrap_or_default()
     }
 
     /// Record that an acknowledgment was received from this peer.
@@ -52,9 +61,6 @@ impl PeerProtocolCounters {
     #[inline]
     pub fn record_acks_received(&self, count: u64) {
         self.acks_received.fetch_add(count, Ordering::Relaxed);
-        if let Ok(mut delay) = self.ack_delay.lock() {
-            delay.acked(count, Instant::now());
-        }
     }
 
     /// Swap the sent-message counter to 0, returning the accumulated value.
@@ -78,17 +84,40 @@ impl PeerProtocolCounters {
     }
 }
 
-/// Send times kept per peer at most. Past it the oldest are dropped, as if never acknowledged.
-const ACK_DELAY_MAX_PENDING: usize = 50_000;
+/// What a peer's acknowledgements say about the link through it. `None` where they say too little.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LinkCongestion {
+    /// The acknowledgement delay above its recent floor: the queue at the peer.
+    pub queueing: Option<Duration>,
+    /// The smoothed acknowledgement delay and its floor, for diagnostics.
+    pub delay: Option<(Duration, Duration)>,
+    /// The share of packets never acknowledged.
+    pub loss: Option<f64>,
+}
 
-/// A packet unacknowledged for this long is taken as lost: its acknowledgement can no longer be
-/// told from that of a later packet.
-const ACK_DELAY_MAX_WAIT: Duration = Duration::from_secs(10);
+/// Packets awaiting acknowledgement kept per peer at most; past it the oldest are taken as lost.
+const ACK_PENDING_MAX: usize = 50_000;
 
-/// Weight of one acknowledged packet in the smoothed delay. About 50 packets make up the average:
-/// a relay batches its acknowledgements every 200 ms, so a single packet's delay carries up to
-/// 200 ms of batching noise, and the average needs that many to settle within a few milliseconds.
-const ACK_DELAY_ALPHA: f64 = 0.02;
+/// A packet unacknowledged for this long is taken as lost.
+const ACK_LOST_AFTER: Duration = Duration::from_secs(5);
+
+/// Time constant of the smoothed delay: two seconds of acknowledgements make up the average.
+///
+/// In time rather than in packets, so a relay the planner has steered away from -- sent only a
+/// probe every few seconds -- is judged by its latest few samples, not by a backlog of old ones,
+/// and can recover.
+const ACK_DELAY_TAU: Duration = Duration::from_secs(2);
+
+/// Batches within the last two time constants needed before the delay says anything. A peer
+/// measured by sparse probes alone reads as unknown, not as whatever its last probe happened to
+/// show -- a single sample carries up to a relay's whole acknowledgement batching interval.
+const ACK_DELAY_MIN_BATCHES: f64 = 5.0;
+
+/// Time constant of the loss share.
+const ACK_LOSS_TAU: Duration = Duration::from_secs(10);
+
+/// Packets, decayed as in [`ACK_LOSS_TAU`], needed before the loss share says anything.
+const ACK_LOSS_MIN_PACKETS: f64 = 20.0;
 
 /// Width of one slice of the floor's window, and the number of slices.
 ///
@@ -98,79 +127,97 @@ const ACK_DELAY_ALPHA: f64 = 0.02;
 const ACK_DELAY_FLOOR_SLICE: Duration = Duration::from_secs(30);
 const ACK_DELAY_FLOOR_SLICES: usize = 10;
 
-/// Acknowledged packets before the floor starts tracking; see [`AckDelay::acked`].
-const ACK_DELAY_WARMUP: u64 = 100;
+/// Exponential weight of something that happened `age` ago, with time constant `tau`.
+fn decay(age: Duration, tau: Duration) -> f64 {
+    (-age.as_secs_f64() / tau.as_secs_f64()).exp()
+}
 
-/// Without an acknowledgement for this long the estimate says nothing. A relay the planner has
-/// steered away from still gets probes, so this ages out only a peer that went quiet altogether.
-const ACK_DELAY_STALE: Duration = Duration::from_secs(10);
-
-/// Delay of the acknowledgements a peer returns, and how far it currently sits above its floor.
+/// Delay and loss of the acknowledgements a peer returns.
 ///
-/// The packets a node sends to a peer come back acknowledged by that peer, in batches. The batch
-/// travels back on the peer's own outgoing link, behind whatever else the peer is sending — so when
-/// that link is saturated, the acknowledgements queue with everything else. Their delay above its
-/// usual floor is a measure of the queue at the peer, available at data rates for every peer the
-/// node sends to. Probes measure the same thing but once every few seconds, and their average
-/// barely moves while a saturated relay's queue swings between empty and full.
+/// The packets a node sends to a peer come back acknowledged by that peer, in batches. A batch
+/// travels back on the peer's own outgoing link, behind whatever else the peer is sending -- so
+/// when that link is saturated, the acknowledgements queue with everything else, and when it
+/// drops, some never come. Their delay above its usual floor measures the queue at the peer, their
+/// absence its loss, at data rates for every peer the node sends to. Probes measure the same once
+/// every few seconds.
 ///
-/// Acknowledgements carry no reference the sender can match cheaply, so a batch of `n` is taken to
-/// acknowledge the `n` oldest unacknowledged packets. Acknowledgements return roughly in sending
-/// order, and the error only shifts which packet's delay is counted, not the average.
+/// Each acknowledgement is matched to its packet by the challenge it solves, so a lost packet
+/// cannot shift the timing of the ones after it. Within a batch, the newest packet is the one
+/// timed: the others also waited for the peer's batching interval, which says nothing about its
+/// link.
 #[derive(Debug, Default)]
 struct AckDelay {
-    sent_at: VecDeque<Instant>,
-    smoothed_ms: Option<f64>,
-    acked: u64,
-    last_ack: Option<Instant>,
+    pending: HashMap<HalfKeyChallenge, Instant>,
+    /// Send order of `pending`, for expiry; may still hold challenges acknowledged since.
+    order: VecDeque<(Instant, HalfKeyChallenge)>,
+    /// Decayed sums of batch delays (ms) and of batch weights, as of `delay_at`.
+    delay_sum: f64,
+    delay_weight: f64,
+    delay_at: Option<Instant>,
+    /// Decayed counts of lost and of all packets, as of `loss_at`.
+    lost: f64,
+    outcomes: f64,
+    loss_at: Option<Instant>,
     /// `(slice start, lowest smoothed delay in it)`, oldest first.
     floor: VecDeque<(Instant, f64)>,
 }
 
 impl AckDelay {
-    fn sent(&mut self, now: Instant) {
-        if self.sent_at.len() >= ACK_DELAY_MAX_PENDING {
-            self.sent_at.pop_front();
+    fn sent(&mut self, challenge: HalfKeyChallenge, now: Instant) {
+        self.expire(now);
+        if self.pending.len() >= ACK_PENDING_MAX {
+            while let Some((_, oldest)) = self.order.pop_front() {
+                if self.pending.remove(&oldest).is_some() {
+                    self.outcome(false, now);
+                    break;
+                }
+            }
         }
-        self.sent_at.push_back(now);
+        if self.pending.insert(challenge, now).is_none() {
+            self.order.push_back((now, challenge));
+        }
     }
 
-    fn acked(&mut self, count: u64, now: Instant) {
-        while self
-            .sent_at
-            .front()
-            .is_some_and(|sent| now.saturating_duration_since(*sent) > ACK_DELAY_MAX_WAIT)
-        {
-            self.sent_at.pop_front();
-        }
-
-        let (mut n, mut total_ms) = (0u64, 0.0);
-        for _ in 0..count {
-            let Some(sent) = self.sent_at.pop_front() else { break };
-            total_ms += now.saturating_duration_since(sent).as_secs_f64() * 1000.0;
-            n += 1;
-        }
-        if n == 0 {
-            return;
-        }
-
-        let mean_ms = total_ms / n as f64;
-        let smoothed = match self.smoothed_ms {
-            Some(prev) => {
-                let alpha = 1.0 - (1.0 - ACK_DELAY_ALPHA).powi(n.min(i32::MAX as u64) as i32);
-                prev + alpha * (mean_ms - prev)
+    fn expire(&mut self, now: Instant) {
+        while let Some((sent, challenge)) = self.order.front().copied() {
+            if now.saturating_duration_since(sent) <= ACK_LOST_AFTER {
+                break;
             }
-            None => mean_ms,
-        };
-        self.smoothed_ms = Some(smoothed);
-        self.last_ack = Some(now);
-        self.acked = self.acked.saturating_add(n);
-        // The first batches average over fewer packets than steady traffic does, so they read low and
-        // would pin the floor below where it belongs.
-        if self.acked < ACK_DELAY_WARMUP {
+            self.order.pop_front();
+            if self.pending.remove(&challenge).is_some() {
+                self.outcome(false, now);
+            }
+        }
+    }
+
+    fn outcome(&mut self, acknowledged: bool, now: Instant) {
+        let w = self.loss_at.map_or(1.0, |at| decay(now.saturating_duration_since(at), ACK_LOSS_TAU));
+        self.lost = self.lost * w + if acknowledged { 0.0 } else { 1.0 };
+        self.outcomes = self.outcomes * w + 1.0;
+        self.loss_at = Some(now);
+    }
+
+    fn acked(&mut self, challenges: &[HalfKeyChallenge], now: Instant) {
+        let mut newest: Option<Instant> = None;
+        for challenge in challenges {
+            if let Some(sent) = self.pending.remove(challenge) {
+                newest = Some(newest.map_or(sent, |n| n.max(sent)));
+                self.outcome(true, now);
+            }
+        }
+        self.expire(now);
+        let Some(newest) = newest else { return };
+
+        let sample_ms = now.saturating_duration_since(newest).as_secs_f64() * 1000.0;
+        let w = self.delay_at.map_or(1.0, |at| decay(now.saturating_duration_since(at), ACK_DELAY_TAU));
+        self.delay_sum = self.delay_sum * w + sample_ms;
+        self.delay_weight = self.delay_weight * w + 1.0;
+        self.delay_at = Some(now);
+
+        if self.delay_weight < ACK_DELAY_MIN_BATCHES {
             return;
         }
-
+        let smoothed = self.delay_sum / self.delay_weight;
         match self.floor.back_mut() {
             Some((start, min)) if now.saturating_duration_since(*start) < ACK_DELAY_FLOOR_SLICE => {
                 *min = min.min(smoothed);
@@ -182,23 +229,42 @@ impl AckDelay {
         }
     }
 
-    fn estimate(&self, now: Instant) -> Option<(Duration, Duration)> {
-        let last = self.last_ack?;
-        if now.saturating_duration_since(last) > ACK_DELAY_STALE {
-            return None;
-        }
-        let smoothed = self.smoothed_ms?;
-        let floor = self.floor.iter().map(|(_, min)| *min).fold(f64::INFINITY, f64::min);
-        if !floor.is_finite() {
-            return None;
-        }
+    fn congestion(&self, now: Instant) -> LinkCongestion {
         let ms = |v: f64| Duration::from_secs_f64(v.max(0.0) / 1000.0);
-        Some((ms(smoothed), ms(floor.min(smoothed))))
+        let delay = self.delay_at.and_then(|at| {
+            let w = decay(now.saturating_duration_since(at), ACK_DELAY_TAU);
+            if self.delay_weight * w < ACK_DELAY_MIN_BATCHES / 2.0 || self.delay_weight < ACK_DELAY_MIN_BATCHES {
+                return None;
+            }
+            let smoothed = self.delay_sum / self.delay_weight;
+            let floor = self.floor.iter().map(|(_, min)| *min).fold(f64::INFINITY, f64::min);
+            floor.is_finite().then(|| (ms(smoothed), ms(floor.min(smoothed))))
+        });
+        // Packets still awaiting an acknowledgement past the deadline count as lost even before an
+        // expiry sweep ran: a peer that stopped answering altogether must not read as clean.
+        let overdue = self
+            .order
+            .iter()
+            .take_while(|(sent, _)| now.saturating_duration_since(*sent) > ACK_LOST_AFTER)
+            .filter(|(_, challenge)| self.pending.contains_key(challenge))
+            .count() as f64;
+        let w = self.loss_at.map_or(1.0, |at| decay(now.saturating_duration_since(at), ACK_LOSS_TAU));
+        let (lost, outcomes) = (self.lost * w + overdue, self.outcomes * w + overdue);
+        LinkCongestion {
+            queueing: delay.map(|(smoothed, floor)| smoothed.saturating_sub(floor)),
+            delay,
+            loss: (outcomes >= ACK_LOSS_MIN_PACKETS).then(|| lost / outcomes),
+        }
     }
+}
 
-    fn queueing_delay(&self, now: Instant) -> Option<Duration> {
-        self.estimate(now).map(|(smoothed, floor)| smoothed.saturating_sub(floor))
-    }
+/// The challenge an acknowledgement solves, for timing it; `None` for a malformed one.
+///
+/// Read from the unverified acknowledgement: what it times is the path back from the peer, and a
+/// peer forging acknowledgements could as well delay genuine ones.
+pub fn ack_challenge(ack: &hopr_api::types::internal::protocol::Acknowledgement) -> Option<HalfKeyChallenge> {
+    use hopr_api::types::primitive::prelude::BytesRepresentable;
+    HalfKey::try_from(&ack.as_ref()[..HalfKey::SIZE]).ok()?.to_challenge().ok()
 }
 
 /// Thread-safe registry of per-peer protocol conformance counters.
@@ -208,6 +274,7 @@ impl AckDelay {
 #[derive(Debug, Default, Clone)]
 pub struct PeerProtocolCounterRegistry {
     inner: Arc<DashMap<OffchainPublicKey, Arc<PeerProtocolCounters>>>,
+    ack_timing: Arc<AtomicBool>,
 }
 
 impl PeerProtocolCounterRegistry {
@@ -220,10 +287,23 @@ impl PeerProtocolCounterRegistry {
             .clone()
     }
 
-    /// The current queueing delay at `peer`, as its acknowledgements show it; `None` without recent
-    /// evidence or for a peer never sent to.
-    pub fn queueing_delay(&self, peer: &OffchainPublicKey) -> Option<Duration> {
-        self.inner.get(peer).and_then(|entry| entry.value().queueing_delay())
+    /// Times every acknowledgement against its packet from now on. Costs one scalar multiplication
+    /// per acknowledgement, so only nodes that route by it (the session's entry) turn it on.
+    pub fn enable_ack_timing(&self) {
+        self.ack_timing.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether acknowledgements are timed; see [`Self::enable_ack_timing`].
+    pub fn ack_timing(&self) -> bool {
+        self.ack_timing.load(Ordering::Relaxed)
+    }
+
+    /// The link through `peer` as its acknowledgements show it; all `None` for a peer never sent to.
+    pub fn congestion(&self, peer: &OffchainPublicKey) -> LinkCongestion {
+        self.inner
+            .get(peer)
+            .map(|entry| entry.value().congestion())
+            .unwrap_or_default()
     }
 
     /// Sets `peer`'s acknowledgement delay outright: `smoothed` now, against a floor of `floor`.
@@ -232,21 +312,28 @@ impl PeerProtocolCounterRegistry {
         let counters = self.get_or_create(peer);
         let mut delay = counters.ack_delay.lock().expect("lock is not poisoned");
         let now = Instant::now();
-        delay.smoothed_ms = Some(smoothed.as_secs_f64() * 1000.0);
-        delay.last_ack = Some(now);
+        delay.delay_sum = smoothed.as_secs_f64() * 1000.0 * 100.0;
+        delay.delay_weight = 100.0;
+        delay.delay_at = Some(now);
         delay.floor = [(now, floor.as_secs_f64() * 1000.0)].into_iter().collect();
     }
 
-    /// Every peer with a current acknowledgement-delay estimate: `(peer, smoothed, floor)`.
-    pub fn ack_delays(&self) -> Vec<(OffchainPublicKey, Duration, Duration)> {
+    /// Sets `peer`'s loss share outright.
+    #[cfg(test)]
+    pub(crate) fn set_loss_for_test(&self, peer: &OffchainPublicKey, loss: f64) {
+        let counters = self.get_or_create(peer);
+        let mut delay = counters.ack_delay.lock().expect("lock is not poisoned");
+        delay.lost = loss * 1000.0;
+        delay.outcomes = 1000.0;
+        delay.loss_at = Some(Instant::now());
+    }
+
+    /// Every peer with something to report: `(peer, congestion)`.
+    pub fn congestions(&self) -> Vec<(OffchainPublicKey, LinkCongestion)> {
         self.inner
             .iter()
-            .filter_map(|entry| {
-                entry
-                    .value()
-                    .ack_delay_estimate()
-                    .map(|(smoothed, floor)| (*entry.key(), smoothed, floor))
-            })
+            .map(|entry| (*entry.key(), entry.value().congestion()))
+            .filter(|(_, c)| c.delay.is_some() || c.loss.is_some())
             .collect()
     }
 
@@ -308,7 +395,10 @@ mod tests {
     use std::time::Duration;
 
     use anyhow::Context;
-    use hopr_api::types::crypto::prelude::{Keypair, OffchainKeypair};
+    use hopr_api::types::crypto::{
+        crypto_traits::Randomizable,
+        prelude::{Keypair, OffchainKeypair},
+    };
 
     use super::*;
 
@@ -496,24 +586,34 @@ mod tests {
     }
 
     /// Sends a packet every 10 ms for `secs` seconds and acknowledges them in 200 ms batches, each
-    /// packet `delay(elapsed)` after it was sent. Returns the time it ended at.
-    fn feed(est: &mut AckDelay, start: std::time::Instant, secs: u64, delay: impl Fn(Duration) -> Duration) -> std::time::Instant {
+    /// packet `delay(elapsed)` after it was sent; `lost(i)` packets are never acknowledged. Returns
+    /// the time it ended at.
+    fn feed(
+        est: &mut AckDelay,
+        start: std::time::Instant,
+        secs: u64,
+        delay: impl Fn(Duration) -> Duration,
+        lost: impl Fn(usize) -> bool,
+    ) -> std::time::Instant {
         let mut now = start;
         let end = start + Duration::from_secs(secs);
-        let mut pending: std::collections::VecDeque<std::time::Instant> = Default::default();
+        let mut pending: std::collections::VecDeque<(std::time::Instant, HalfKeyChallenge)> = Default::default();
         let mut next_flush = start + Duration::from_millis(200);
+        let mut i = 0usize;
         while now < end {
-            est.sent(now);
-            pending.push_back(now);
+            let challenge = HalfKey::random().to_challenge().expect("a random half key is a valid scalar");
+            est.sent(challenge, now);
+            if !lost(i) {
+                pending.push_back((now, challenge));
+            }
+            i += 1;
             now += Duration::from_millis(10);
             if now >= next_flush {
                 // The batch carries every packet that has reached the peer by the flush.
                 let d = delay(now - start);
-                let n = pending.iter().take_while(|sent| **sent + d <= now).count();
-                pending.drain(..n);
-                if n > 0 {
-                    est.acked(n as u64, now);
-                }
+                let n = pending.iter().take_while(|(sent, _)| *sent + d <= now).count();
+                let batch: Vec<_> = pending.drain(..n).map(|(_, c)| c).collect();
+                est.acked(&batch, now);
                 next_flush += Duration::from_millis(200);
             }
         }
@@ -523,66 +623,85 @@ mod tests {
     #[test]
     fn ack_delay_should_report_no_queue_on_a_steady_link() -> anyhow::Result<()> {
         let mut est = AckDelay::default();
-        let now = feed(&mut est, std::time::Instant::now(), 30, |_| Duration::from_millis(40));
-        let q = est.queueing_delay(now).context("a busy peer must have an estimate")?;
+        let now = feed(&mut est, std::time::Instant::now(), 20, |_| Duration::from_millis(40), |_| false);
+        let c = est.congestion(now);
+        let q = c.queueing.context("a busy peer must have an estimate")?;
         assert!(q < Duration::from_millis(10), "a constant delay is the floor, not a queue: {q:?}");
+        assert_eq!(c.loss, Some(0.0));
         Ok(())
     }
 
     #[test]
     fn ack_delay_should_report_a_queue_that_builds_up() -> anyhow::Result<()> {
         let mut est = AckDelay::default();
-        let now = feed(&mut est, std::time::Instant::now(), 40, |elapsed| {
-            Duration::from_millis(if elapsed < Duration::from_secs(30) { 40 } else { 190 })
-        });
-        let q = est.queueing_delay(now).context("a busy peer must have an estimate")?;
+        let now = feed(
+            &mut est,
+            std::time::Instant::now(),
+            30,
+            |elapsed| Duration::from_millis(if elapsed < Duration::from_secs(20) { 40 } else { 190 }),
+            |_| false,
+        );
+        let q = est.congestion(now).queueing.context("a busy peer must have an estimate")?;
         assert!(
-            q > Duration::from_millis(120) && q < Duration::from_millis(170),
+            q > Duration::from_millis(125) && q < Duration::from_millis(175),
             "150 ms of extra delay must read as about 150 ms of queue: {q:?}"
         );
         Ok(())
     }
 
+    /// The flaw of matching acknowledgements in sending order: every lost packet shifted the timing of
+    /// all the packets after it, and a lossy link read as seconds of queue.
     #[test]
-    fn ack_delay_should_say_nothing_once_the_peer_went_quiet() {
+    fn ack_delay_should_not_mistake_loss_for_a_queue() -> anyhow::Result<()> {
         let mut est = AckDelay::default();
-        let now = feed(&mut est, std::time::Instant::now(), 5, |_| Duration::from_millis(40));
-        assert!(est.queueing_delay(now).is_some());
-        assert!(est.queueing_delay(now + ACK_DELAY_STALE + Duration::from_secs(1)).is_none());
-    }
-
-    #[test]
-    fn ack_delay_should_forget_packets_that_were_never_acknowledged() -> anyhow::Result<()> {
-        let mut est = AckDelay::default();
-        let start = std::time::Instant::now();
-        // 100 packets lost: sent, never acknowledged.
-        for i in 0..100 {
-            est.sent(start + Duration::from_millis(i));
-        }
-        let later = start + ACK_DELAY_MAX_WAIT + Duration::from_secs(1);
-        let now = feed(&mut est, later, 30, |_| Duration::from_millis(40));
-        let (smoothed, _) = est.estimate(now).context("a busy peer must have an estimate")?;
-        assert!(
-            smoothed < Duration::from_millis(200),
-            "lost packets must not inflate the delay of the ones acknowledged later: {smoothed:?}"
-        );
+        let now = feed(&mut est, std::time::Instant::now(), 20, |_| Duration::from_millis(40), |i| i % 10 < 3);
+        let c = est.congestion(now);
+        let q = c.queueing.context("a busy peer must have an estimate")?;
+        assert!(q < Duration::from_millis(10), "loss must not read as a queue: {q:?}");
+        let loss = c.loss.context("enough packets for a loss share")?;
+        assert!((0.25..0.35).contains(&loss), "30 % of the packets were lost: {loss}");
         Ok(())
     }
 
     #[test]
-    fn registry_should_expose_the_queueing_delay_per_peer() {
+    fn ack_delay_should_report_a_peer_that_stopped_answering_as_lossy() -> anyhow::Result<()> {
+        let mut est = AckDelay::default();
+        let start = std::time::Instant::now();
+        let now = feed(&mut est, start, 10, |_| Duration::from_millis(40), |_| false);
+        // From here on nothing comes back.
+        let now = feed(&mut est, now, 10, |_| Duration::from_millis(40), |_| true);
+        let loss = est.congestion(now).loss.context("a peer sent to has a loss share")?;
+        assert!(loss > 0.5, "a peer that stopped answering must read as lossy: {loss}");
+        Ok(())
+    }
+
+    #[test]
+    fn ack_delay_should_say_nothing_about_delay_once_the_peer_went_quiet() {
+        let mut est = AckDelay::default();
+        let now = feed(&mut est, std::time::Instant::now(), 5, |_| Duration::from_millis(40), |_| false);
+        assert!(est.congestion(now).queueing.is_some());
+        assert!(est.congestion(now + Duration::from_secs(10)).queueing.is_none());
+    }
+
+    #[test]
+    fn registry_should_time_acknowledgements_against_their_packets() {
         let registry = PeerProtocolCounterRegistry::default();
         let peer = *OffchainKeypair::random().public();
-        assert!(registry.queueing_delay(&peer).is_none(), "an unknown peer has no estimate");
+        assert_eq!(registry.congestion(&peer), LinkCongestion::default(), "an unknown peer has no estimate");
+        assert!(!registry.ack_timing(), "timing is off unless a node turns it on");
+        registry.enable_ack_timing();
+        assert!(registry.ack_timing());
+
         let counters = registry.get_or_create(&peer);
-        counters.record_message_sent();
-        counters.record_acks_received(1);
-        assert!(registry.queueing_delay(&peer).is_none(), "no estimate before the warm-up");
-        for _ in 0..ACK_DELAY_WARMUP {
-            counters.record_message_sent();
-            counters.record_acks_received(1);
+        let mut keys = Vec::new();
+        for _ in 0..30 {
+            let key = HalfKey::random();
+            counters.record_awaiting_ack(key.to_challenge().expect("valid"));
+            keys.push(key);
         }
-        assert!(registry.queueing_delay(&peer).is_some());
-        assert_eq!(registry.ack_delays().len(), 1);
+        // Acknowledgements carry the half key; its challenge is what matches the packet.
+        let challenges: Vec<_> = keys.iter().map(|k| k.to_challenge().expect("valid")).collect();
+        counters.record_acked(&challenges, Instant::now());
+        assert_eq!(registry.congestion(&peer).loss, Some(0.0));
     }
 }

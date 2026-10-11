@@ -335,6 +335,8 @@ impl<const C: usize> SessionSocket<C, Stateless<C>> {
                     capacity: cfg.capacity,
                     max_item_age,
                     max_frames_behind_gap: cfg.max_frames_behind_gap,
+                    // A datagram session's window is a cap; the wait follows how late frames are.
+                    adaptive_wait: cfg.datagram && cfg.datagram_reorder_window.is_some(),
                 })
                 // Discard frames missing from the sequence
                 .filter_map(move |maybe_frame| {
@@ -548,6 +550,7 @@ impl<const C: usize, S: SocketState<C> + Clone + 'static> SessionSocket<C, S> {
                 capacity: cfg.capacity,
                 max_item_age: cfg.max_frame_age,
                 max_frames_behind_gap: cfg.max_frames_behind_gap,
+                adaptive_wait: false,
             })
             // Discard frames missing from the sequence and
             // notify the State about emitted or discarded frames

@@ -95,7 +95,94 @@ pub struct Sequencer<S: futures::Stream> {
     /// Head-of-line bound: abandon the frame due next once the sequence has advanced this far
     /// past it, rather than holding everything for `max_wait`. `None` disables it.
     max_frames_behind_gap: Option<usize>,
+    /// When set, `max_wait` is only the cap, and the wait actually applied follows how late frames
+    /// turn out to be; see [`Lateness`].
+    lateness: Option<Lateness>,
     state: State,
+}
+
+/// Shortest wait an adaptive sequencer applies, and the one it starts from.
+const ADAPTIVE_MIN_WAIT: Duration = Duration::from_millis(10);
+const ADAPTIVE_INITIAL_WAIT: Duration = Duration::from_millis(50);
+
+/// How often an adaptive sequencer re-checks a gap: its wait changes, so it cannot arm a timer for
+/// the wait once.
+const ADAPTIVE_TICK: Duration = Duration::from_millis(5);
+
+/// Gaps given up on that are remembered, so a frame that turns up after its gap was abandoned
+/// still counts as a lateness sample.
+const ADAPTIVE_ABANDONED: usize = 256;
+
+/// How late out-of-order frames arrive, and the wait for a missing frame that follows from it.
+///
+/// A gap in the sequence is either a frame still on its way along a slower path, or one that is
+/// lost. Waiting for the first is worth it -- the transport above (TCP inside a tunnel) reads
+/// reordering as loss -- but each wait for the second stalls everything behind it. So the wait
+/// tracks the lateness of the frames that did turn up, the way TCP's retransmission timer tracks
+/// round trips: a smoothed mean plus four mean deviations. Lost frames never turn up and so never
+/// lengthen it; frames that arrive after their gap was given up do, so a wait that was too short
+/// grows.
+#[derive(Debug)]
+struct Lateness {
+    cap: Duration,
+    mean_ms: f64,
+    dev_ms: f64,
+    samples: u64,
+    /// `(frame id, when the frame behind it started waiting)` of gaps given up on, newest last.
+    abandoned: std::collections::VecDeque<(FrameId, Instant)>,
+}
+
+impl Lateness {
+    fn new(cap: Duration) -> Self {
+        Self {
+            cap,
+            mean_ms: 0.0,
+            dev_ms: 0.0,
+            samples: 0,
+            abandoned: Default::default(),
+        }
+    }
+
+    fn sample(&mut self, late: Duration) {
+        let ms = late.as_secs_f64() * 1000.0;
+        if self.samples == 0 {
+            self.mean_ms = ms;
+            self.dev_ms = ms / 2.0;
+        } else {
+            let err = ms - self.mean_ms;
+            self.mean_ms += err / 8.0;
+            self.dev_ms += (err.abs() - self.dev_ms) / 4.0;
+        }
+        self.samples = self.samples.saturating_add(1);
+    }
+
+    fn abandoned(&mut self, id: FrameId, waiting_since: Instant) {
+        if self.abandoned.len() >= ADAPTIVE_ABANDONED {
+            self.abandoned.pop_front();
+        }
+        self.abandoned.push_back((id, waiting_since));
+    }
+
+    /// A frame below the sequence turned up: if its gap was given up on, count how long it was
+    /// waited for plus how much later it came.
+    fn arrived_after_abandon<T: PartialOrd<FrameId>>(&mut self, item: &T, now: Instant) {
+        if let Some(pos) = self
+            .abandoned
+            .iter()
+            .position(|(id, _)| item.partial_cmp(id) == Some(std::cmp::Ordering::Equal))
+            && let Some((_, since)) = self.abandoned.remove(pos)
+        {
+            self.sample(now.saturating_duration_since(since));
+        }
+    }
+
+    fn wait(&self) -> Duration {
+        if self.samples == 0 {
+            return ADAPTIVE_INITIAL_WAIT.min(self.cap);
+        }
+        Duration::from_secs_f64((self.mean_ms + 4.0 * self.dev_ms).max(0.0) / 1000.0)
+            .clamp(ADAPTIVE_MIN_WAIT.min(self.cap), self.cap)
+    }
 }
 
 impl<S> Sequencer<S>
@@ -127,8 +214,16 @@ where
             // turning every momentary gap into loss. One later frame is the strictest evidence
             // that still *is* evidence.
             max_frames_behind_gap: max_frames_behind_gap.map(|n| n.max(1)),
+            lateness: None,
             state: State::Polling,
         }
+    }
+
+    /// Makes `max_wait` the cap of a wait that follows the lateness of out-of-order frames.
+    fn with_adaptive_wait(mut self) -> Self {
+        self.lateness = Some(Lateness::new(self.max_wait));
+        self.timer = futures_time::task::sleep(ADAPTIVE_TICK.into());
+        self
     }
 }
 
@@ -187,9 +282,20 @@ where
 
                                 if item.lt(this.next_id) {
                                     // Do not accept older frame ids
+                                    if let Some(lateness) = this.lateness.as_mut() {
+                                        lateness.arrived_after_abandon(&item, Instant::now());
+                                    }
                                     tracing::error!("old item");
                                     *this.state = State::Polling;
                                 } else {
+                                    // The frame due next filling a gap: as late as the frame behind it
+                                    // has been waiting.
+                                    if let (Some(lateness), Some(behind)) =
+                                        (this.lateness.as_mut(), this.buffer.peek().map(|b| b.0.buffered_at))
+                                        && item.partial_cmp(this.next_id) == Some(std::cmp::Ordering::Equal)
+                                    {
+                                        lateness.sample(behind.elapsed());
+                                    }
                                     // Push new item to the buffer
                                     tracing::trace!("new item");
                                     this.buffer.push(std::cmp::Reverse(Buffered {
@@ -241,12 +347,12 @@ where
                             tracing::trace!("emit next frame");
 
                             return Poll::Ready(this.buffer.pop().map(|item| Ok(item.0.item)));
-                        } else if this.last_emitted.elapsed() >= *this.max_wait
+                        } else if this.last_emitted.elapsed() >= this.lateness.as_ref().map_or(*this.max_wait, Lateness::wait)
                             // The frame waiting right behind the gap has itself been held for max_wait: the
                             // gap is lost, whatever was emitted in between. Timing gaps only from the last
                             // emission drains a buffer of K interleaved gaps at one gap per max_wait (K x 3 s
                             // of head-of-line blocking after a relay outage, every new frame queued behind it).
-                            || next.buffered_at.elapsed() >= *this.max_wait
+                            || next.buffered_at.elapsed() >= this.lateness.as_ref().map_or(*this.max_wait, Lateness::wait)
                             || this.buffer.len() == this.buffer.capacity()
                             // The sequence has moved far enough past the gap to conclude the
                             // missing frame was lost rather than reordered. Waiting out `max_wait`
@@ -268,6 +374,9 @@ where
                             })
                         {
                             let discarded = *this.next_id;
+                            if let Some(lateness) = this.lateness.as_mut() {
+                                lateness.abandoned(discarded, next.buffered_at);
+                            }
                             *this.next_id = this.next_id.wrapping_add(1);
                             // `last_emitted` is intentionally NOT reset here: it is only reset
                             // when an actual frame is emitted. Resetting it per discarded id would
@@ -340,6 +449,9 @@ pub struct SequencerConfig {
     /// two frames arriving ahead is ordinary reordering across paths of differing latency; a queue
     /// building up behind a gap is a frame that was lost.
     pub max_frames_behind_gap: Option<usize>,
+    /// Treat [`Self::max_wait`] as a cap and wait only as long as out-of-order frames have lately
+    /// been late (see [`Lateness`]).
+    pub adaptive_wait: bool,
 }
 
 /// Stream extensions methods for item sequencing.
@@ -375,13 +487,18 @@ pub trait SequencerExt: futures::Stream {
         Self::Item: Ord + PartialOrd<FrameId>,
         Self: Sized,
     {
-        Sequencer::new(
+        let sequencer = Sequencer::new(
             self,
             cfg.max_wait,
             cfg.capacity,
             cfg.max_item_age,
             cfg.max_frames_behind_gap,
-        )
+        );
+        if cfg.adaptive_wait {
+            sequencer.with_adaptive_wait()
+        } else {
+            sequencer
+        }
     }
 }
 
@@ -528,6 +645,7 @@ mod tests {
             capacity: 4096,
             max_item_age: None,
             max_frames_behind_gap: Some(2),
+            adaptive_wait: false,
         });
         pin_mut!(seq_stream);
 
@@ -548,6 +666,50 @@ mod tests {
         // Held open deliberately: closing the sink would drain the buffer through `State::Done`,
         // which has its own emit path and would pass this test without the rule under test.
         drop(seq_sink);
+        Ok(())
+    }
+
+    /// An adaptive sequencer waits for a missing frame about as long as out-of-order frames have
+    /// lately been late, not for its whole cap: a lost frame then stalls the ones behind it for tens
+    /// of milliseconds instead of seconds, while the reordering it learned from is still hidden.
+    #[test_log::test(tokio::test)]
+    async fn adaptive_sequencer_should_wait_about_as_long_as_frames_have_been_late() -> anyhow::Result<()> {
+        let cap = Duration::from_secs(2);
+        let (seq_sink, seq_stream) = futures::channel::mpsc::unbounded::<u32>();
+        let seq_stream = seq_stream.sequencer_with(SequencerConfig {
+            max_wait: cap,
+            capacity: 4096,
+            max_item_age: None,
+            max_frames_behind_gap: None,
+            adaptive_wait: true,
+        });
+        pin_mut!(seq_stream);
+
+        // Ten pairs swapped by 20 ms: frame 2k+1 arrives 20 ms after 2k+2.
+        let feeder = tokio::spawn(async move {
+            for k in 0..10u32 {
+                seq_sink.unbounded_send(2 * k + 2)?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                seq_sink.unbounded_send(2 * k + 1)?;
+            }
+            // Frame 21 is lost; 22 arrives.
+            seq_sink.unbounded_send(22)?;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            anyhow::Ok(seq_sink)
+        });
+
+        let in_order: Vec<u32> = seq_stream.by_ref().take(20).try_collect().await?;
+        assert_eq!((1..=20).collect::<Vec<_>>(), in_order, "the swapped pairs come out in order");
+
+        let gap_seen = std::time::Instant::now();
+        assert!(matches!(seq_stream.try_next().await, Err(SessionError::FrameDiscarded(21))));
+        let waited = gap_seen.elapsed();
+        assert!(
+            waited < Duration::from_millis(300),
+            "a lost frame must be given up after about the lateness learned (~20 ms), not the {cap:?} cap: {waited:?}"
+        );
+        assert_eq!(Some(22), seq_stream.try_next().await?);
+        feeder.abort();
         Ok(())
     }
 
@@ -575,6 +737,7 @@ mod tests {
             capacity: 4096,
             max_item_age: None,
             max_frames_behind_gap: Some(4),
+            adaptive_wait: false,
         });
         pin_mut!(seq_stream);
 
@@ -619,6 +782,7 @@ mod tests {
             capacity: 4096,
             max_item_age: None,
             max_frames_behind_gap: Some(3),
+            adaptive_wait: false,
         });
         pin_mut!(seq_stream);
 
@@ -654,6 +818,7 @@ mod tests {
             capacity: 4096,
             max_item_age: None,
             max_frames_behind_gap: None,
+            adaptive_wait: false,
         });
         pin_mut!(seq_stream);
 

@@ -159,7 +159,11 @@ async fn start_outgoing_packet_pipeline<AppOut, E, WOut, WOutErr>(
                         #[cfg(all(feature = "telemetry", not(test)))]
                         METRIC_PACKET_COUNT.increment(&["sent"]);
 
-                        counters.get_or_create(&packet.next_hop).record_message_sent();
+                        let peer_counters = counters.get_or_create(&packet.next_hop);
+                        peer_counters.record_message_sent();
+                        if counters.ack_timing() {
+                            peer_counters.record_awaiting_ack(packet.ack_challenge);
+                        }
                         tracing::trace!(peer = packet.next_hop.to_peerid_str(), "protocol message out");
                         Some((packet.next_hop.into(), packet.data))
                     }
@@ -344,7 +348,24 @@ async fn start_incoming_packet_pipeline<WIn, WOut, D, T, TEvt, AckIn, AckOut, Ap
                     Either::Left(async move {
                         let IncomingAcknowledgementPacket { previous_hop, received_acks, .. } = *ack;
                         tracing::trace!(previous_hop = previous_hop.to_peerid_str(), num_acks = received_acks.len(), "incoming acknowledgements");
-                        counters.get_or_create(&previous_hop).record_acks_received(received_acks.len() as u64);
+                        let peer_counters = counters.get_or_create(&previous_hop);
+                        peer_counters.record_acks_received(received_acks.len() as u64);
+                        if counters.ack_timing() {
+                            // Each acknowledgement is matched to its packet by the challenge it solves,
+                            // a scalar multiplication apiece: done on the CPU pool, timed as of now.
+                            let at = std::time::Instant::now();
+                            let acks = received_acks.clone();
+                            hopr_utils::runtime::prelude::spawn(async move {
+                                if let Ok(challenges) = hopr_utils::parallelize::cpu::spawn_fifo_blocking(
+                                    move || acks.iter().filter_map(super::counters::ack_challenge).collect::<Vec<_>>(),
+                                    "ack_timing",
+                                )
+                                .await
+                                {
+                                    peer_counters.record_acked(&challenges, at);
+                                }
+                            });
+                        }
 
                         ack_incoming
                             .send((previous_hop, received_acks))

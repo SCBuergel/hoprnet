@@ -32,7 +32,7 @@ pub mod return_path_recovery;
 /// Records SURB round-trips as network graph edge telemetry.
 pub mod surb_telemetry;
 
-pub use counters::{PeerProtocolCounterRegistry, PeerProtocolCounters};
+pub use counters::{LinkCongestion, PeerProtocolCounterRegistry, PeerProtocolCounters};
 pub use pipeline::{
     AcknowledgementPipelineConfig, NodeType, PacketPipelineBuilder, PacketPipelineConfig, PacketPipelineProcesses,
     PoolArbitrationConfig, Unset,
