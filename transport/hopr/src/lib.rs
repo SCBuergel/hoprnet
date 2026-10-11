@@ -316,6 +316,9 @@ where
         if let Some(v) = std::env::var("HOPR_INTERNAL_PATH_CONGESTION_RELATIVE").ok() {
             planner_config.congestion_relative = v.trim() != "0";
         }
+        if let Some(v) = std::env::var("HOPR_INTERNAL_PATH_CONGESTION_INTEGRAL").ok() {
+            planner_config.congestion_integral = v.trim() == "1";
+        }
         // A/B switch for the share of return-path draws made for exploration.
         if let Some(share) = std::env::var("HOPR_INTERNAL_PATH_RETURN_EXPLORATION")
             .ok()

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures::{StreamExt as _, TryStreamExt, stream::FuturesUnordered};
 #[cfg(all(feature = "telemetry", not(test)))]
@@ -167,6 +167,10 @@ pub struct PathPlannerConfig {
     /// happen to read lowest. Only the difference between relays says which of them to avoid.
     #[default = true]
     pub congestion_relative: bool,
+    /// Steer by a per-relay weight that a relay's queueing and loss move gradually (see
+    /// [`RelayWeights`]) instead of by a factor recomputed from the latest estimate at every draw.
+    #[default = false]
+    pub congestion_integral: bool,
 }
 
 fn validate_unit_interval(value: f64) -> std::result::Result<(), ValidationError> {
@@ -471,6 +475,48 @@ pub struct PathPlanner<Surb, R, S> {
     congestion: Option<crate::protocol::PeerProtocolCounterRegistry>,
     congestion_delay_reference: Duration,
     congestion_relative: bool,
+    relay_weights: Option<Arc<std::sync::Mutex<RelayWeights>>>,
+}
+
+/// Lowest draw weight [`RelayWeights`] gives a relay: low enough that a saturated relay carries next
+/// to nothing, high enough that it still carries the odd packet that shows when it recovers.
+const RELAY_WEIGHT_MIN: f64 = 0.02;
+
+/// How fast a relay's weight moves per second and per reference of excess queueing.
+const RELAY_WEIGHT_GAIN: f64 = 1.0;
+
+/// How often a relay's weight is moved at most.
+const RELAY_WEIGHT_STEP: Duration = Duration::from_millis(100);
+
+/// Per-relay draw weights that integrate how far each relay's queue sits above a target.
+///
+/// A factor recomputed from the latest estimate at every draw reacts fully to every swing of a
+/// noisy estimate: on links with jitter the healthy relays read a few tens of milliseconds of queue
+/// in turn, the draw piles onto whichever happens to read lowest, its queue rises, and the favourite
+/// flips every second or two. Here each relay's weight `w` moves by `w <- w * exp(-g * e * dt)`,
+/// where `e` is its queueing above the least-queued sibling, less a target, in units of the
+/// reference -- plus its loss in units of [`CONGESTION_LOSS_REFERENCE`]. A relay held above the
+/// target loses weight within a second or two; one at or below it regains weight at `e^1` per
+/// second up to 1. At equilibrium a slow relay carries just what keeps its queue near the target:
+/// its capacity is used, but its queue no longer holds the others back.
+#[derive(Debug, Default)]
+struct RelayWeights {
+    weights: HashMap<OffchainPublicKey, (f64, std::time::Instant)>,
+}
+
+impl RelayWeights {
+    fn weight(&mut self, relay: &OffchainPublicKey, excess: Option<f64>, now: std::time::Instant) -> f64 {
+        let entry = self.weights.entry(*relay).or_insert((1.0, now));
+        let dt = now.saturating_duration_since(entry.1);
+        if let Some(excess) = excess
+            && dt >= RELAY_WEIGHT_STEP
+        {
+            entry.0 = (entry.0 * (-RELAY_WEIGHT_GAIN * excess * dt.as_secs_f64().min(1.0)).exp())
+                .clamp(RELAY_WEIGHT_MIN, 1.0);
+            entry.1 = now;
+        }
+        entry.0
+    }
 }
 
 /// Share of the draws a path keeps when the relay next to this node queues `queueing` on top of
@@ -532,6 +578,9 @@ where
             congestion: None,
             congestion_delay_reference: config.congestion_delay_reference,
             congestion_relative: config.congestion_relative,
+            relay_weights: config
+                .congestion_integral
+                .then(|| Arc::new(std::sync::Mutex::new(RelayWeights::default()))),
         }
     }
 
@@ -558,6 +607,30 @@ where
         } else {
             Duration::ZERO
         };
+        if let Some(weights) = &self.relay_weights
+            && let Ok(mut weights) = weights.lock()
+        {
+            let now = std::time::Instant::now();
+            let reference = self.congestion_delay_reference.as_secs_f64();
+            return relays
+                .iter()
+                .zip(links.iter())
+                .map(|(relay, link)| match (relay, link) {
+                    (Some(relay), Some(link)) => {
+                        let queue = link
+                            .queueing
+                            .map(|q| (q.saturating_sub(least).as_secs_f64() - reference) / reference);
+                        let loss = link.loss.map(|l| l / CONGESTION_LOSS_REFERENCE);
+                        let excess = match (queue, loss) {
+                            (None, None) => None,
+                            (q, l) => Some(q.unwrap_or(-1.0) + l.unwrap_or(0.0)),
+                        };
+                        weights.weight(relay, excess, now)
+                    }
+                    _ => 1.0,
+                })
+                .collect();
+        }
         links
             .iter()
             .map(|link| {
@@ -2089,6 +2162,29 @@ mod tests {
         registry.set_ack_delay_for_test(&a, Duration::from_millis(370), Duration::from_millis(120));
         let behind = return_draws_through(&planner, &a, 2000).await;
         assert!(behind < 300, "a relayer 150 ms behind its sibling must lose most draws: {behind} of 2000");
+    }
+
+    #[test]
+    fn relay_weights_should_fall_while_a_relay_queues_and_recover_once_it_stops() {
+        let mut w = RelayWeights::default();
+        let relay = pubkey(&SECRET_A);
+        let t0 = std::time::Instant::now();
+        assert_eq!(1.0, w.weight(&relay, Some(4.0), t0), "a new relay starts at full weight");
+        let mut t = t0;
+        for _ in 0..30 {
+            t += Duration::from_millis(100);
+            w.weight(&relay, Some(4.0), t);
+        }
+        let low = w.weight(&relay, Some(4.0), t);
+        assert!(low <= 0.03, "three seconds well above the target must take the weight to the floor: {low}");
+        for _ in 0..50 {
+            t += Duration::from_millis(100);
+            w.weight(&relay, Some(-1.0), t);
+        }
+        let back = w.weight(&relay, Some(-1.0), t);
+        assert!(back >= 0.99, "five seconds at the target must restore the weight: {back}");
+        let unknown = w.weight(&relay, None, t + Duration::from_secs(1));
+        assert_eq!(back, unknown, "no evidence leaves the weight where it is");
     }
 
     #[tokio::test]
