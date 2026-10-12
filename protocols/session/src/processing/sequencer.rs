@@ -114,9 +114,14 @@ const ADAPTIVE_INITIAL_WAIT: Duration = Duration::from_millis(100);
 /// the wait once.
 const ADAPTIVE_TICK: Duration = Duration::from_millis(5);
 
-/// Gaps given up on that are remembered, so a frame that turns up after its gap was abandoned
-/// still counts as a lateness sample.
-const ADAPTIVE_ABANDONED: usize = 256;
+/// How many given-up gaps the adaptive wait remembers, so that their frames are still delivered when they
+/// turn up. A segment whose frame id is below the sequence and whose gap is no longer remembered is
+/// dropped as already seen, and its frame is lost for good. Gaps are given up in bursts (a stalled link
+/// releases its share of a second's frames at once; 500 a second were seen under jitter) and the frames
+/// behind them arrive one to four seconds later, so a memory of a few hundred forgot nine in ten of them:
+/// about 2 % of a download's frames were dropped here while every one of them had arrived. Entries are
+/// 16 bytes; the scans run only for frames below the sequence.
+const ADAPTIVE_ABANDONED: usize = 16384;
 
 /// How late out-of-order frames arrive, and the wait for a missing frame that follows from it.
 ///
