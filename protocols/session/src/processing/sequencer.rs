@@ -120,8 +120,23 @@ const ADAPTIVE_TICK: Duration = Duration::from_millis(5);
 /// releases its share of a second's frames at once; 500 a second were seen under jitter) and the frames
 /// behind them arrive one to four seconds later, so a memory of a few hundred forgot nine in ten of them:
 /// about 2 % of a download's frames were dropped here while every one of them had arrived. Entries are
-/// 16 bytes; the scans run only for frames below the sequence.
+/// 24 bytes (id, Instant) plus the eviction order: about 400 KB per session at the cap; lookups are by id.
 const ADAPTIVE_ABANDONED: usize = 16384;
+
+/// The frame id of an item that is only comparable with frame ids: a binary search over the id range
+/// (32 comparisons), `None` if the item equals no id.
+fn frame_id_of<T: PartialOrd<FrameId>>(item: &T) -> Option<FrameId> {
+    use std::cmp::Ordering::*;
+    let (mut lo, mut hi) = (FrameId::MIN, FrameId::MAX);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match item.partial_cmp(&mid)? {
+            Greater => lo = mid + 1,
+            _ => hi = mid,
+        }
+    }
+    (item.partial_cmp(&lo)? == Equal).then_some(lo)
+}
 
 /// How late out-of-order frames arrive, and the wait for a missing frame that follows from it.
 ///
@@ -139,7 +154,10 @@ pub(crate) struct Lateness {
     dev_ms: f64,
     samples: u64,
     /// `(frame id, when the frame behind it started waiting)` of gaps given up on, newest last.
-    abandoned: std::collections::VecDeque<(FrameId, Instant)>,
+    /// Given-up gaps by frame id, with when their frame was first waited for; `abandoned_order` keeps
+    /// the insertion order for eviction (ids already removed are skipped on the way).
+    abandoned: std::collections::BTreeMap<FrameId, Instant>,
+    abandoned_order: std::collections::VecDeque<FrameId>,
 }
 
 impl Lateness {
@@ -150,6 +168,7 @@ impl Lateness {
             dev_ms: 0.0,
             samples: 0,
             abandoned: Default::default(),
+            abandoned_order: Default::default(),
         }
     }
 
@@ -168,34 +187,35 @@ impl Lateness {
 
     fn abandoned(&mut self, id: FrameId, waiting_since: Instant) {
         if self.abandoned.len() >= ADAPTIVE_ABANDONED {
-            self.abandoned.pop_front();
+            while let Some(oldest) = self.abandoned_order.pop_front() {
+                if self.abandoned.remove(&oldest).is_some() {
+                    break;
+                }
+            }
         }
-        self.abandoned.push_back((id, waiting_since));
+        if self.abandoned.insert(id, waiting_since).is_none() {
+            self.abandoned_order.push_back(id);
+        }
     }
 
     /// Frame `id`, below the sequence, turned up: if its gap was given up on, count how long it was
     /// waited for plus how much later it came.
     pub(crate) fn late_frame(&mut self, id: FrameId, now: Instant) {
-        if let Some(pos) = self.abandoned.iter().position(|(gap, _)| *gap == id)
-            && let Some((_, since)) = self.abandoned.remove(pos)
-        {
+        if let Some(since) = self.abandoned.remove(&id) {
             self.sample(now.saturating_duration_since(since));
         }
     }
 
     /// Whether frame `id`'s gap was given up on and the frame has not turned up since.
     pub(crate) fn is_abandoned(&self, id: FrameId) -> bool {
-        self.abandoned.iter().any(|(gap, _)| *gap == id)
+        self.abandoned.contains_key(&id)
     }
 
     /// As [`Self::late_frame`], for an item that knows its frame id only by comparison; `true` if
     /// its gap had been given up on.
     fn arrived_after_abandon<T: PartialOrd<FrameId>>(&mut self, item: &T, now: Instant) -> bool {
-        if let Some(pos) = self
-            .abandoned
-            .iter()
-            .position(|(id, _)| item.partial_cmp(id) == Some(std::cmp::Ordering::Equal))
-            && let Some((_, since)) = self.abandoned.remove(pos)
+        if let Some(id) = frame_id_of(item)
+            && let Some(since) = self.abandoned.remove(&id)
         {
             self.sample(now.saturating_duration_since(since));
             return true;
