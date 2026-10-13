@@ -567,7 +567,9 @@ pub(crate) fn link_factor(link: &crate::protocol::LinkCongestion, delay_referenc
 /// and only among at least two measured relays: a single relay is the only return path there is, and
 /// judged absolutely under jitter the exit would discard most of its SURBs through it. The share is
 /// capped at one half, so the counterparty keeps at least half of its return paths whatever the queue.
-/// Empty when the reference is zero (steering off).
+/// The baseline is the least-queued relay, not the planner's configurable quantile: with two relays the two
+/// coincide, and with more the minimum is the conservative choice for discarding SURBs (only relays queueing
+/// above the best one lose any). Empty when the reference is zero (steering off).
 pub(crate) fn relayer_skip_shares<K: Copy>(
     links: &[(K, crate::protocol::LinkCongestion)],
     reference: Duration,
@@ -1540,6 +1542,14 @@ mod tests {
         }
     }
 
+    /// `small_config` with the congestion-aware draw on (off by default): what the steering tests need.
+    fn steering_config() -> PathPlannerConfig {
+        PathPlannerConfig {
+            congestion_delay_reference: std::time::Duration::from_millis(50),
+            ..small_config()
+        }
+    }
+
     // ── test: zero-hop path ───────────────────────────────────────────────────
 
     /// A Session names its destination by chain address; the SURB telemetry names it by packet key.
@@ -2082,7 +2092,7 @@ mod tests {
 
         let cfg = PathPlannerConfig {
             min_paths_anonymity_floor: floor,
-            ..small_config()
+            ..steering_config()
         };
         let selector = HoprGraphPathSelector::new(
             me,
@@ -2300,7 +2310,7 @@ mod tests {
             graph.add_edge(&src, &dst).expect("edge should be addable");
             mark_edge_full(&graph, &src, &dst);
         }
-        let cfg = small_config();
+        let cfg = steering_config();
         let selector = HoprGraphPathSelector::new(
             me,
             graph.clone(),

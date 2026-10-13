@@ -196,6 +196,12 @@ impl Lateness {
         if self.abandoned.insert(id, waiting_since).is_none() {
             self.abandoned_order.push_back(id);
         }
+        // Gaps filled late leave their id in the order queue; drop those once they are the majority, so
+        // the queue stays bounded by twice the map's cap.
+        if self.abandoned_order.len() > 2 * ADAPTIVE_ABANDONED {
+            let live = &self.abandoned;
+            self.abandoned_order.retain(|id| live.contains_key(id));
+        }
     }
 
     /// Frame `id`, below the sequence, turned up: if its gap was given up on, count how long it was
