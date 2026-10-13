@@ -88,6 +88,18 @@ impl<T: Send + 'static> PeerSink<T> {
 /// backpressure timeout, but only to that peer's own packets.
 const EGRESS_OVERFLOW_CAPACITY: usize = 1024;
 
+/// [`EGRESS_OVERFLOW_CAPACITY`], or HOPR_INTERNAL_EGRESS_OVERFLOW_CAPACITY (experiment knob, read once).
+fn egress_overflow_capacity() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("HOPR_INTERNAL_EGRESS_OVERFLOW_CAPACITY")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(EGRESS_OVERFLOW_CAPACITY)
+    })
+}
+
 type PeerStreamCache<T> = moka::sync::Cache<PeerId, PeerSink<T>>;
 
 /// Error produced by the per-peer write pump ([`StallGuardSink`]).
@@ -507,7 +519,7 @@ where
                         // so the wait never holds back the packets of other peers. See
                         // EGRESS_OVERFLOW_CAPACITY.
                         let (mut overflow_tx, mut overflow_rx) =
-                            futures::channel::mpsc::channel::<<C as Decoder>::Item>(EGRESS_OVERFLOW_CAPACITY);
+                            futures::channel::mpsc::channel::<<C as Decoder>::Item>(egress_overflow_capacity());
                         let _ = overflow_tx.try_send(msg);
                         *sink.overflow.lock().unwrap_or_else(|e| e.into_inner()) = Some(overflow_tx);
                         let overflow = sink.overflow.clone();

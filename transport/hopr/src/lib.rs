@@ -635,7 +635,29 @@ where
 
         let msg_codec = crate::protocol::HoprBinaryCodec {};
         let (wire_msg_tx, wire_msg_rx) =
-            protocol::stream::process_stream_protocol(msg_codec, transport_network.clone(), self.cfg.stream).await?;
+            {
+                // Experiment knobs for the per-peer egress queue: how many packets may wait for a peer's
+                // stream (HOPR_INTERNAL_PEER_CHANNEL_CAPACITY, default 5000) and how long a packet waits
+                // for space before it is dropped (HOPR_INTERNAL_EGRESS_BACKPRESSURE_MS, default 2000). A
+                // deep queue in front of a link whose congestion window collapsed holds packets for
+                // seconds; a shallow one turns that into early loss the path planner can see.
+                let mut stream_cfg = self.cfg.stream;
+                if let Some(n) = std::env::var("HOPR_INTERNAL_PEER_CHANNEL_CAPACITY")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+                {
+                    stream_cfg.per_peer_channel_capacity = n;
+                }
+                if let Some(ms) = std::env::var("HOPR_INTERNAL_EGRESS_BACKPRESSURE_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|&ms| ms > 0)
+                {
+                    stream_cfg.egress_backpressure_timeout = std::time::Duration::from_millis(ms);
+                }
+                protocol::stream::process_stream_protocol(msg_codec, transport_network.clone(), stream_cfg).await?
+            };
 
         // Shared mixing channel: all per-destination clones of `mixing_channel_tx` push into one
         // heap, so cross-destination packets are mixed together rather than each destination
