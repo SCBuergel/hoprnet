@@ -156,8 +156,11 @@ pub struct PathPlannerConfig {
     /// Every draw therefore scales a path's weight by `1 / (1 + (q / reference)²)`, where `q` is
     /// how far the acknowledgements of the relay next to this node lag behind their recent floor
     /// (see `PeerProtocolCounters::queueing_delay`). It applies at draw time, so it follows a queue
-    /// within about a second rather than at the next cache refresh. Zero disables it.
-    #[default(Duration::from_millis(50))]
+    /// within about a second rather than at the next cache refresh. Zero disables it, which is the
+    /// default: the steering is an experiment, measured with 20 ms (fleet and production A/Bs,
+    /// `HOPR_INTERNAL_PATH_CONGESTION_DELAY_MS=20`), and it needs acknowledgement timing on the entry
+    /// (`HOPR_INTERNAL_ACK_TIMING=1`).
+    #[default(Duration::from_millis(0))]
     pub congestion_delay_reference: Duration,
     /// Judge each relay's queueing against the least-queued relay among the candidates of the same
     /// draw, rather than against zero.
@@ -557,6 +560,32 @@ pub(crate) fn link_factor(link: &crate::protocol::LinkCongestion, delay_referenc
         1.0 / (1.0 + x * x)
     });
     delay * loss
+}
+
+/// Share of the SURBs through each relay an exit should skip, from what its acknowledgements show
+/// (`PeerProtocolCounterRegistry::congestions`). Only queueing above the least-queued relay counts,
+/// and only among at least two measured relays: a single relay is the only return path there is, and
+/// judged absolutely under jitter the exit would discard most of its SURBs through it. The share is
+/// capped at one half, so the counterparty keeps at least half of its return paths whatever the queue.
+/// Empty when the reference is zero (steering off).
+pub(crate) fn relayer_skip_shares<K: Copy>(
+    links: &[(K, crate::protocol::LinkCongestion)],
+    reference: Duration,
+) -> Vec<(K, f64)> {
+    let measured: Vec<Duration> = links.iter().filter_map(|(_, l)| l.queueing).collect();
+    if reference.is_zero() || measured.len() < 2 {
+        return Vec::new();
+    }
+    let least = measured.into_iter().min().unwrap_or_default();
+    links
+        .iter()
+        .filter_map(|(peer, link)| {
+            let mut link = *link;
+            link.queueing = link.queueing.map(|q| q.saturating_sub(least));
+            let p = (1.0 - link_factor(&link, reference)).clamp(0.0, 0.5);
+            (p > 0.05).then_some((*peer, p))
+        })
+        .collect()
 }
 
 impl<Surb, R, S> PathPlanner<Surb, R, S>
@@ -1156,6 +1185,29 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relayer_skip_shares_need_two_measured_relays_and_cap_at_one_half() {
+        use super::relayer_skip_shares;
+        use crate::protocol::LinkCongestion;
+        use std::time::Duration;
+        let reference = Duration::from_millis(20);
+        let queued = |ms| LinkCongestion { queueing: Some(Duration::from_millis(ms)), ..Default::default() };
+        // one relay alone, however queued: nothing is skipped
+        assert!(relayer_skip_shares(&[(1u8, queued(40))], reference).is_empty());
+        assert!(relayer_skip_shares(&[(1u8, queued(40)), (2u8, LinkCongestion::default())], reference).is_empty());
+        // steering off: nothing is skipped
+        assert!(relayer_skip_shares(&[(1u8, queued(40)), (2u8, queued(0))], Duration::ZERO).is_empty());
+        // two measured relays: only the one queueing above the other is skipped, at most half
+        let shares = relayer_skip_shares(&[(1u8, queued(40)), (2u8, queued(0))], reference);
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].0, 1);
+        assert!(shares[0].1 > 0.05 && shares[0].1 <= 0.5, "{}", shares[0].1);
+        let shares = relayer_skip_shares(&[(1u8, queued(400)), (2u8, queued(0))], reference);
+        assert_eq!(shares, vec![(1u8, 0.5)]);
+        // both equally queued: nothing stands out
+        assert!(relayer_skip_shares(&[(1u8, queued(40)), (2u8, queued(40))], reference).is_empty());
+    }
+
     use std::str::FromStr;
 
     use anyhow::Context;

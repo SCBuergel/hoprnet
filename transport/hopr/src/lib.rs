@@ -580,12 +580,13 @@ where
     {
         let mut processes = AbortableList::<HoprTransportProcess>::default();
 
-        // The entry of a session is the node that draws its paths, so it is the one that times its
-        // relays' acknowledgements (HOPR_INTERNAL_ACK_TIMING=0/1 overrides).
+        // Timing the relays' acknowledgements is what the congestion-aware draw and the exit's SURB skip
+        // run on. Off by default like the steering itself (HOPR_INTERNAL_ACK_TIMING=1 enables it; an
+        // entry needs it for the draw, an exit for the skip).
         let ack_timing = std::env::var("HOPR_INTERNAL_ACK_TIMING")
             .ok()
             .map(|v| v.trim() == "1")
-            .unwrap_or(role == protocol::NodeType::Entry);
+            .unwrap_or(false);
         if ack_timing {
             self.counters.enable_ack_timing();
         }
@@ -603,21 +604,9 @@ where
                     use hopr_api::chain::KeyIdMapping;
                     loop {
                         futures_timer::Delay::new(Duration::from_millis(250)).await;
-                        let links = counters.congestions();
-                        let least = links
-                            .iter()
-                            .filter_map(|(_, l)| l.queueing)
-                            .min()
-                            .filter(|_| links.iter().filter(|(_, l)| l.queueing.is_some()).count() >= 2)
-                            .unwrap_or_default();
-                        let skip = links
+                        let skip = crate::path::planner::relayer_skip_shares(&counters.congestions(), reference)
                             .into_iter()
-                            .filter_map(|(peer, mut link)| {
-                                link.queueing = link.queueing.map(|q| q.saturating_sub(least));
-                                let p = (1.0 - crate::path::planner::link_factor(&link, reference)).clamp(0.0, 0.95);
-                                let id = chain_api.key_id_mapper_ref().map_key_to_id(&peer)?;
-                                (p > 0.05).then_some((id, p))
-                            })
+                            .filter_map(|(peer, p)| Some((chain_api.key_id_mapper_ref().map_key_to_id(&peer)?, p)))
                             .collect();
                         surb_store.set_relayer_skip(skip);
                     }

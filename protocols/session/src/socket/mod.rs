@@ -364,7 +364,8 @@ impl<const C: usize> SessionSocket<C, Stateless<C>> {
                     let _span = stage3_span.enter();
                     future::ready(match maybe_frame {
                         Ok(frame) => {
-                            last_emitted_frame_clone.store(frame.0.frame_id, std::sync::atomic::Ordering::Relaxed);
+                            // A frame delivered late (its gap given up on) must not move the floor back.
+                            last_emitted_frame_clone.fetch_max(frame.0.frame_id, std::sync::atomic::Ordering::Relaxed);
                             if frame.0.is_terminating {
                                 tracing::warn!("terminating frame received");
                                 packets_in_abort_handle.abort();

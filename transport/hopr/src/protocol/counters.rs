@@ -96,7 +96,9 @@ pub struct LinkCongestion {
 }
 
 /// Packets awaiting acknowledgement kept per peer at most; past it the oldest are taken as lost.
-const ACK_PENDING_MAX: usize = 50_000;
+/// Bound on challenges awaiting an acknowledgement per peer: five seconds (`ACK_LOST_AFTER`) at a few
+/// thousand packets per second, about 1.5 MB at the worst. The expiry sweep normally keeps it far lower.
+const ACK_PENDING_MAX: usize = 16_384;
 
 /// A packet unacknowledged for this long is taken as lost.
 const ACK_LOST_AFTER: Duration = Duration::from_secs(5);
